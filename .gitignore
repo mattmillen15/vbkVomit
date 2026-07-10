@@ -1,0 +1,13 @@
+# loot + caches (contain creds / extracted hives)
+vbkvomit_loot/
+vbkvomit_cache/
+*.hive
+*.dit
+*.creds
+secretsdump.txt
+
+# scratch
+_*.log
+_*.txt
+__pycache__/
+*.pyc
