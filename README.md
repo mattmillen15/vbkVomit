@@ -22,6 +22,19 @@ Use `--no-ntds` to skip it.
 Loot + scan caches land in `vbkvomit_loot/` and `vbkvomit_cache/` next to the script.
 Re-running against the same backup is instant (it's all cached).
 
+### `--fast` (experimental, ~5–15x faster)
+
+```bash
+python3 vbkvomit.py --local-path /mnt/backups/dc.vbk --fast   # needs: pip install dissect
+```
+
+Instead of the hand-rolled scan+reassembly, `--fast` uses Fox-IT's [`dissect`](https://github.com/fox-it/dissect)
+library to resolve the VBK's content-addressed (deduplicated) blocks by their digest, mount
+the embedded NTFS volume, and read the files directly — no block search. Cold run drops from
+~40 s to ~8 s on our sample (full DC dump, identical output). It's opt-in while the default
+reassembler stays the proven path; if `dissect` isn't installed it prints install guidance
+and you just drop `--fast`.
+
 ## How it works
 
 See [research.md](research.md) — short version: Veeam stores the disk as ~1 MB blocks that
@@ -36,3 +49,4 @@ directory (~5 MB) to know where everything is.
 - `cifs-utils` (for `-t` SMB mode)
 - `lz4` (fast block decode — ~5x; falls back to pure python without it)
 - `numpy` (fast ESE checksums; falls back without it)
+- `dissect` (only for `--fast`; `pip install dissect`)

