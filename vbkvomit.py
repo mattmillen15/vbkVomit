@@ -70,8 +70,13 @@ def die(msg, code=1):
 def is_mounted(path):
     return Path("/proc/mounts").read_text().find(f" {path} ") >= 0
 
+def _sudo():
+    """['sudo'] prefix when we aren't already root, else []."""
+    return [] if os.geteuid() == 0 else ["sudo"]
+
 def force_umount(path):
-    for cmd in (["umount", path], ["umount", "-l", path]):
+    pre = _sudo()
+    for cmd in ([*pre, "umount", path], [*pre, "umount", "-l", path]):
         if subprocess.run(cmd, capture_output=True).returncode == 0:
             return True
     return False
@@ -1302,18 +1307,22 @@ def create_cifs_creds(domain, user, password):
     return path
 
 def mount_cifs(host, share, creds_file):
+    pre = _sudo()
     mnt = Path("/mnt") / share
-    mnt.mkdir(parents=True, exist_ok=True)
+    subprocess.run([*pre, "mkdir", "-p", str(mnt)], capture_output=True)
     if is_mounted(str(mnt)):
         c = input(f"[?] {mnt} mounted. [r]euse/[u]nmount/[s]kip? ").lower()
         if c == "r": return str(mnt)
         elif c == "u": force_umount(str(mnt))
         else: return None
     sz = Path(creds_file).stat().st_size if creds_file and Path(creds_file).exists() else 0
-    fast = "vers=3.1.1,rsize=4194304,wsize=4194304,cache=loose,iocharset=utf8,ro"
+    # uid/gid so the mounted files are owned by the invoking user (mount runs
+    # as root via sudo, but the tool itself stays unprivileged).
+    fast = (f"vers=3.1.1,rsize=4194304,wsize=4194304,cache=loose,iocharset=utf8,"
+            f"ro,uid={os.getuid()},gid={os.getgid()}")
     opts = (f"credentials={creds_file},{fast}" if sz else f"guest,{fast}")
-    r = subprocess.run(["mount", "-t", "cifs", f"//{host}/{share}", str(mnt), "-o", opts],
-                       capture_output=True)
+    r = subprocess.run([*pre, "mount", "-t", "cifs", f"//{host}/{share}", str(mnt),
+                        "-o", opts], capture_output=True)
     if r.returncode == 0:
         print(f"[+] Mounted {share} at {mnt} (read-only)")
         return str(mnt)
@@ -1381,12 +1390,18 @@ def select_vbk(files):
 
 # ═══ Setup helpers ═══════════════════════════════════════════════════════════
 
-def ensure_root():
-    if os.geteuid() != 0:
-        die("This mode mounts the remote share with mount.cifs, which "
-            "requires root.\n    Re-run with sudo, e.g.:\n"
-            f"        sudo python3 {os.path.basename(sys.argv[0])} " +
-            " ".join(sys.argv[1:]))
+def ensure_mount_privs():
+    """SMB mode mounts the share with mount.cifs (root-only), but the tool
+    itself runs unprivileged and only shells `mount`/`umount` through sudo.
+    Confirm that will work; if sudo needs a password, note it up front."""
+    if os.geteuid() == 0:
+        return
+    if shutil.which("sudo") is None:
+        die("Need root to mount the share and 'sudo' isn't available. "
+            "Re-run as root, or use --local-path on an already-mounted share.")
+    if subprocess.run(["sudo", "-n", "true"], capture_output=True).returncode != 0:
+        print("[*] Mounting the share needs sudo — you may be prompted for "
+              "your password.")
 
 def _secretsdump_imports_ok(cmd):
     """True if `cmd -h` runs without dying on an import error.  Catches the
@@ -1536,7 +1551,7 @@ Examples:
     args = p.parse_args()
 
     if args.target is not None:
-        ensure_root()
+        ensure_mount_privs()
     check_deps()
     sd = find_secretsdump()
     if not sd:
