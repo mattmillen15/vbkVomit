@@ -29,10 +29,11 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 BANNER = r"""
- ___  _   ___  _  __   _ ____  __  __ ___ _____ ___
- \ \ / | | _ )| |/ /  | |  _ \/  \/  |_ _|_   _|_  )
-  \ V /| |_) || ' < \__/ | |_) | |\/| || |  | |  / /
-   \_/ |____/ |_|\_\____/|____/|_|  |_|___| |_| /___|
+__     ______  _  __ __     _____  __  __ ___ _____
+\ \   / / __ )| |/ / \ \   / / _ \|  \/  |_ _|_   _|
+ \ \ / /|  _ \| ' /   \ \ / / | | | |\/| || |  | |
+  \ V / | |_) | . \    \ V /| |_| | |  | || |  | |
+   \_/  |____/|_|\_\    \_/  \___/|_|  |_|___| |_|
 
   VBK → NTFS MFT walk → SAM/SECURITY hive reassembly → secretsdump
 """
