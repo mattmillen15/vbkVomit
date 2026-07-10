@@ -127,14 +127,16 @@ def _lz4_compressed_len(stream, target_size):
     return p
 
 
-def lz4_block_decode(stream, target_size):
+def lz4_block_decode(stream, target_size, clen=None):
     """Decode one Veeam LZ4 block -> (bytes, compressed_len).  Uses native lz4
-    (~40x faster than pure python) when it's installed and the block decodes
-    cleanly; falls back to the tolerant pure-python decoder for partial/edge
-    blocks or when lz4 is missing."""
+    (~40x faster than pure python) when installed.  `clen` is the exact
+    compressed length: if the caller already knows it (from the block
+    descriptor's +36 field) we skip the token-walk entirely — the single
+    biggest cost of a decode — and go straight to the C decoder."""
     if _lz4_block is not None:
         try:
-            clen = _lz4_compressed_len(stream, target_size)
+            if not clen:
+                clen = _lz4_compressed_len(stream, target_size)
             out = _lz4_block.decompress(stream[:clen], uncompressed_size=target_size)
             if len(out) == target_size:
                 return out, clen
@@ -191,10 +193,12 @@ class FibBlock:
     def payload_offset(self):
         return self.file_offset + FIB_HEADER_SIZE
 
-    def decompress(self, fh, max_payload=2 << 20):
+    def decompress(self, fh, max_payload=2 << 20, clen=None):
         fh.seek(self.payload_offset())
-        payload = fh.read(self.compressed_size or max_payload)
-        data, consumed = lz4_block_decode(payload, self.decompressed_size)
+        # If we know the exact compressed length (from the descriptor) read
+        # only that — no over-read, no token-walk.
+        payload = fh.read(clen if clen else (self.compressed_size or max_payload))
+        data, consumed = lz4_block_decode(payload, self.decompressed_size, clen)
         if not self.compressed_size:
             self.compressed_size = consumed
         return data
@@ -354,7 +358,8 @@ def decode_runs(runs):
 
 def _check_mft_worker(args):
     """Multiprocess worker: decompress one FIB block, check for MFT records."""
-    vbk_path, off = args
+    vbk_path, off, *rest = args
+    clen = rest[0] if rest else None
     try:
         with open(vbk_path, "rb") as fh:
             fh.seek(off); hdr = fh.read(12)
@@ -362,8 +367,8 @@ def _check_mft_worker(args):
             blk = FibBlock(off, hdr)
             if blk.decompressed_size != 0x100000: return (off, False)
             fh.seek(off + 12)
-            payload = fh.read(2 << 20)
-            data, _ = lz4_block_decode(payload, 0x100000)
+            payload = fh.read(clen if clen else (2 << 20))
+            data, _ = lz4_block_decode(payload, 0x100000, clen)
         if len(data) < 8192: return (off, False)
         file_count = sum(1 for i in range(0, 8192, 1024)
                          if data[i:i+4] in (b'FILE', b'BAAD'))
@@ -376,15 +381,16 @@ def _walk_mft_block_worker(args):
     """Decompress one MFT FIB block and return its allocated MFT records as
     (rec_num, name_list, data_attr_or_None) tuples.  Avoids passing the full
     1024-byte record over IPC."""
-    vbk_path, off = args
+    vbk_path, off, *rest = args
+    clen = rest[0] if rest else None
     out = []
     try:
         with open(vbk_path, "rb") as fh:
             fh.seek(off); hdr = fh.read(12)
             blk = FibBlock(off, hdr)
             fh.seek(off + 12)
-            payload = fh.read(2 << 20)
-            data, _ = lz4_block_decode(payload, 0x100000)
+            payload = fh.read(clen if clen else (2 << 20))
+            data, _ = lz4_block_decode(payload, 0x100000, clen)
         for r in range(0, len(data), 1024):
             rec = data[r:r+1024]
             if rec[:4] not in (b'FILE', b'BAAD'): continue
@@ -401,7 +407,8 @@ def _walk_mft_block_worker(args):
 
 def _check_regf_worker(args):
     """Multiprocess worker: decompress one FIB block, check for regf at given offset."""
-    vbk_path, off, target_in_off = args
+    vbk_path, off, target_in_off, *rest = args
+    clen = rest[0] if rest else None
     try:
         with open(vbk_path, "rb") as fh:
             fh.seek(off); hdr = fh.read(12)
@@ -409,8 +416,8 @@ def _check_regf_worker(args):
             blk = FibBlock(off, hdr)
             if blk.decompressed_size != 0x100000: return (off, False)
             fh.seek(off + 12)
-            payload = fh.read(2 << 20)
-            data, _ = lz4_block_decode(payload, 0x100000)
+            payload = fh.read(clen if clen else (2 << 20))
+            data, _ = lz4_block_decode(payload, 0x100000, clen)
         if len(data) < target_in_off + 0x100: return (off, False)
         if data[target_in_off:target_in_off+4] != b'regf': return (off, False)
         seq_pri = struct.unpack_from("<I", data, target_in_off+0x04)[0]
@@ -425,7 +432,8 @@ def _check_regf_worker(args):
 
 def _check_ese_worker(args):
     """Worker: check for ESE database magic (efcdab89) at +4 of given offset."""
-    vbk_path, off, target_in_off = args
+    vbk_path, off, target_in_off, *rest = args
+    clen = rest[0] if rest else None
     try:
         with open(vbk_path, "rb") as fh:
             fh.seek(off); hdr = fh.read(12)
@@ -433,8 +441,8 @@ def _check_ese_worker(args):
             blk = FibBlock(off, hdr)
             if blk.decompressed_size != 0x100000: return (off, False)
             fh.seek(off + 12)
-            payload = fh.read(2 << 20)
-            data, _ = lz4_block_decode(payload, 0x100000)
+            payload = fh.read(clen if clen else (2 << 20))
+            data, _ = lz4_block_decode(payload, 0x100000, clen)
         if len(data) < target_in_off + 16: return (off, False)
         if data[target_in_off+4:target_in_off+8] != b'\xef\xcd\xab\x89':
             return (off, False)
@@ -450,7 +458,8 @@ def _check_ese_pages_worker(args):
     ESE 8 KB pages have a checksum at 0 (non-zero) and a page number
     that increments across pages.  We require multiple consecutive 8 KB
     pages to look ESE-like."""
-    vbk_path, off, target_in_off = args
+    vbk_path, off, target_in_off, *rest = args
+    clen = rest[0] if rest else None
     try:
         with open(vbk_path, "rb") as fh:
             fh.seek(off); hdr = fh.read(12)
@@ -458,8 +467,8 @@ def _check_ese_pages_worker(args):
             blk = FibBlock(off, hdr)
             if blk.decompressed_size != 0x100000: return (off, False)
             fh.seek(off + 12)
-            payload = fh.read(2 << 20)
-            data, _ = lz4_block_decode(payload, 0x100000)
+            payload = fh.read(clen if clen else (2 << 20))
+            data, _ = lz4_block_decode(payload, 0x100000, clen)
         # Validate that 4 consecutive 8KB pages at target_in_off look like ESE pages.
         # ESE page header layout (DB engine 0x620, page size 8192):
         #   +0x00 u32 page_xor_chk
@@ -490,6 +499,7 @@ class VBKExtractor:
         self.lba_anchors = []
         self._mft_blocks = None
         self._decomp_cache = {}
+        self._clen_map = {}
         self.want_ntds = want_ntds
         if fib_offsets is not None:
             self.fib_offsets = fib_offsets
@@ -523,7 +533,12 @@ class VBKExtractor:
                 ss = struct.unpack_from("<I", e, 13)[0]
                 if e[0] > 0x10 or fo == 0 or fo >= fsz or (fo & 0xFFF):
                     break
-                out.append((fo, ss))
+                # +36 u32 = (compressed payload length + 12).  Gives the exact
+                # LZ4 length so the C decoder needs no token-walk.
+                clen = struct.unpack_from("<I", e, 36)[0] - 12
+                if not (0 < clen < ss):
+                    clen = 0          # implausible -> fall back to token-walk
+                out.append((fo, ss, clen))
             return out
 
         try:
@@ -535,10 +550,11 @@ class VBKExtractor:
                 return None
             header = head[:first_fib]
             descs = {}
+            clen_map = {}
             region_ptrs = {}
             for p in range(0, len(header) - 60, 0x1000):
-                for fo, ss in bank_descs(header[p:p + 0x1000]):
-                    descs[fo] = ss
+                for fo, ss, cl in bank_descs(header[p:p + 0x1000]):
+                    descs[fo] = ss; clen_map[fo] = cl
             # Collect region pointers: [ptr:u64][size:u32] pairs in the header
             # whose ptr is a page-aligned in-file offset past the data start and
             # whose size is a sane region length.  (Superblock pointer tables
@@ -562,8 +578,8 @@ class VBKExtractor:
                 budget -= sz
                 region = read(ptr, sz)
                 for q in range(0, len(region) - 60, 0x1000):
-                    for fo, ss in bank_descs(region[q:q + 0x1000]):
-                        descs[fo] = ss
+                    for fo, ss, cl in bank_descs(region[q:q + 0x1000]):
+                        descs[fo] = ss; clen_map[fo] = cl
             if len(descs) < 16:
                 return None
             offsets = sorted(descs)
@@ -577,19 +593,27 @@ class VBKExtractor:
                         if offsets[i] + descs[offsets[i]] == offsets[i + 1])
             if chain < (len(offsets) - 1) * 0.9:
                 return None
+            self._clen_map = clen_map
             return offsets
         except Exception:
             return None
 
     def _load_or_scan_fib_offsets(self):
         cache = self._cache_path("fib_offsets")
+        clen_cache = self._cache_path("clen_map")
         if cache.exists():
+            if clen_cache.exists():
+                for ln in clen_cache.read_text().splitlines():
+                    o, c = ln.split(":"); self._clen_map[int(o, 16)] = int(c)
             return [int(l, 16) for l in cache.read_text().splitlines()]
         # Fast path: parse Veeam's block directory (~5 MB read vs. ~10 GB scan).
         t0 = time.time()
         offsets = self._blocks_from_metadata()
         if offsets:
             cache.write_text("\n".join(f"{o:x}" for o in offsets))
+            if self._clen_map:
+                clen_cache.write_text("\n".join(f"{o:x}:{c}"
+                                      for o, c in self._clen_map.items()))
             tprint(f"  [+] {len(offsets)} FIB blocks from metadata "
                    f"({time.time()-t0:.1f}s)")
             return offsets
@@ -609,7 +633,7 @@ class VBKExtractor:
 
     def decompress_at(self, file_off):
         self.fh.seek(file_off); hdr = self.fh.read(12)
-        return FibBlock(file_off, hdr).decompress(self.fh)
+        return FibBlock(file_off, hdr).decompress(self.fh, clen=self._clen_map.get(file_off))
 
     def find_mft_blocks(self):
         """Find MFT FIB blocks. Uses NTFS VBR to narrow the search window first."""
@@ -661,10 +685,11 @@ class VBKExtractor:
         try:
             from multiprocessing import Pool
         except ImportError:
-            return [o for o in fib_offsets if worker((self.vbk_path, o))[1]]
+            return [o for o in fib_offsets
+                    if worker((self.vbk_path, o, self._clen_map.get(o)))[1]]
         t0 = time.time()
         with Pool(n_proc) as pool:
-            args = [(self.vbk_path, o) for o in fib_offsets]
+            args = [(self.vbk_path, o, self._clen_map.get(o)) for o in fib_offsets]
             hits = []
             consec = 0
             processed = 0
@@ -773,7 +798,8 @@ class VBKExtractor:
         try:
             from multiprocessing import Pool
             with Pool(n_proc) as pool:
-                args = [(self.vbk_path, off, target_in_off) for fi, off in candidates]
+                args = [(self.vbk_path, off, target_in_off, self._clen_map.get(off))
+                        for fi, off in candidates]
                 idx_by_off = {off: fi for fi, off in candidates}
                 for off, ok in pool.imap(worker, args, chunksize=10):
                     if ok:
@@ -784,7 +810,7 @@ class VBKExtractor:
                 pool.terminate()
         except Exception:
             for fi, off in candidates:
-                ok = worker((self.vbk_path, off, target_in_off))[1]
+                ok = worker((self.vbk_path, off, target_in_off, self._clen_map.get(off)))[1]
                 if ok:
                     self.lba_anchors.append((target_lba, fi))
                     self.lba_anchors.sort()
@@ -916,7 +942,7 @@ class VBKExtractor:
         try:
             from multiprocessing import Pool
             with Pool(n_proc) as pool:
-                args = [(self.vbk_path, off) for off in mft_blocks]
+                args = [(self.vbk_path, off, self._clen_map.get(off)) for off in mft_blocks]
                 for batch in pool.imap_unordered(_walk_mft_block_worker, args, chunksize=4):
                     for rec_num, names, da in batch:
                         self._mft_names[rec_num] = names
@@ -925,7 +951,7 @@ class VBKExtractor:
         except Exception as e:
             tprint(f"  [!] parallel walk failed ({e}); falling back single-thread")
             for off in mft_blocks:
-                for rec_num, names, da in _walk_mft_block_worker((self.vbk_path, off)):
+                for rec_num, names, da in _walk_mft_block_worker((self.vbk_path, off, self._clen_map.get(off))):
                     self._mft_names[rec_num] = names
                     self._mft_data_attrs[rec_num] = da
         self._mft_index = True

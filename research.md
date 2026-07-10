@@ -90,6 +90,29 @@ tracking only output length (no copying) to find where the real compressed data 
 let the C decoder rip. Net ~5x on every decompress, which is most of the runtime — a fresh
 first run dropped from ~129 s to ~47 s. Falls back to pure-python if `lz4` isn't installed.
 
+## Skipping the token-walk: the descriptor knows the length
+
+C lz4 needs the exact compressed length, and we were walking the tokens to find
+it (~23 ms/block, the whole cost of a decode once the C decoder does the actual
+work in <1 ms). Turns out the block descriptor already has it: **offset +36 is
+`compressed_length + 12`**. So we read it straight from metadata, hand C lz4 the
+exact slice, and skip the walk entirely. Fresh first run went ~47 s → ~41 s.
+
+That flipped the bottleneck one more time: with decode now basically free, the
+block search is **pure I/O** — it reads ~2.8 GB of candidate blocks over SMB to
+find ntds. Which leads to...
+
+## The ~20 s wall
+
+To locate ntds's DB header we search ~a couple thousand blocks around a guess
+(the backup scrambles block order, so the guess is off by ~2000). ntds.dit's
+first cluster lands at in-block offset 0x6a000, so **every candidate has to be
+decompressed that far** (~43% of a 1 MB block) before we can check it. That's
+~1.2–2.8 GB of reads no matter how fast the decoder is — a hard ~15–33 s floor
+on this backup. Partial-decompress tricks shave it toward ~25 s but not under 20,
+and they're fragile. The only clean way under is Veeam's own LBA→block map, which
+is the content-addressed hash B-tree below — and that we couldn't crack.
+
 ## The rabbit hole we didn't finish: skipping the block search
 
 The slow part of a cold run is finding ntds/hive blocks — the backup scrambles block order
@@ -122,10 +145,10 @@ import and picking one that works instead of the first one on PATH.
 
 ## What still costs time
 
-- **The block search.** Locating ntds/hive blocks means decompressing ~a couple thousand
-  candidate blocks to check their contents. Even with C lz4 that's the bulk of a cold first
-  run (~35 s of the ~47 s). Killing it needs the LBA→hash recipe above. Re-runs are cached
-  (~15 s), so this only bites the first pass on a given backup.
+- **The block search (I/O).** Locating ntds means reading ~2.8 GB of candidate blocks off
+  the share — the bulk of a cold first run (~33 s of the ~41 s). It's now I/O-bound, not
+  CPU-bound. Killing it needs the LBA→hash recipe above. Re-runs are cached (~15 s), so this
+  only bites the first pass on a given backup.
 - **One NTFS volume.** We parse the first NTFS volume in the backup. If a DC keeps
   `NTDS\` on a separate drive, ntds.dit isn't on the volume we're reading and we won't find
   it. SAM/SECURITY still come out fine.
