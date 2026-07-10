@@ -90,8 +90,54 @@ def size_str(path):
 FIB_MAGIC = b"\x0f\x00\x00\xf8"
 FIB_HEADER_SIZE = 12
 
+try:
+    import lz4.block as _lz4_block
+except Exception:
+    _lz4_block = None
+
+
+def _lz4_compressed_len(stream, target_size):
+    """Walk LZ4 block tokens tracking only output length (no copies) and return
+    the exact compressed length that produces target_size bytes.  Native lz4
+    needs that exact length — the payload has trailing padding otherwise."""
+    out = 0; p = 0; n = len(stream)
+    while out < target_size and p < n:
+        tok = stream[p]; p += 1
+        ll = tok >> 4
+        if ll == 15:
+            while p < n:
+                b = stream[p]; p += 1; ll += b
+                if b != 255: break
+        p += ll; out += ll
+        if out >= target_size or p + 2 > n:
+            break
+        p += 2
+        ml = (tok & 0xf) + 4
+        if (tok & 0xf) == 15:
+            while p < n:
+                b = stream[p]; p += 1; ml += b
+                if b != 255: break
+        out += ml
+    return p
+
 
 def lz4_block_decode(stream, target_size):
+    """Decode one Veeam LZ4 block -> (bytes, compressed_len).  Uses native lz4
+    (~40x faster than pure python) when it's installed and the block decodes
+    cleanly; falls back to the tolerant pure-python decoder for partial/edge
+    blocks or when lz4 is missing."""
+    if _lz4_block is not None:
+        try:
+            clen = _lz4_compressed_len(stream, target_size)
+            out = _lz4_block.decompress(stream[:clen], uncompressed_size=target_size)
+            if len(out) == target_size:
+                return out, clen
+        except Exception:
+            pass
+    return _lz4_block_decode_py(stream, target_size)
+
+
+def _lz4_block_decode_py(stream, target_size):
     """LZ4 BLOCK format decoder tolerant of Veeam stream termination."""
     out = bytearray()
     p = 0
@@ -701,17 +747,19 @@ class VBKExtractor:
             pass
 
     def _add_anchor_for_lba(self, target_lba, target_in_off, worker, search_radius=400):
-        """Search FIB blocks (around interpolation guess) for one matching `worker`."""
+        """Locate the FIB block for target_lba by content-matching `worker`,
+        spiralling out from the interpolation guess."""
         for lba, fi in self.lba_anchors:
             if lba == target_lba: return True
 
         guessed_off = self.lba_to_fib(target_lba)
+        n = len(self.fib_offsets)
         guess_fi = self.fib_offsets.index(guessed_off) if guessed_off in self.fib_offsets else 0
         candidates = []
         for delta in range(search_radius + 1):
             for sign in (1, -1):
                 fi = guess_fi + sign * delta if delta else guess_fi
-                if 0 <= fi < len(self.fib_offsets):
+                if 0 <= fi < n:
                     candidates.append((fi, self.fib_offsets[fi]))
                 if delta == 0: break
 

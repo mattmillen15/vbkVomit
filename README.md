@@ -34,4 +34,5 @@ directory (~5 MB) to know where everything is.
 
 - `impacket` (secretsdump)
 - `cifs-utils` (for `-t` SMB mode)
+- `lz4` (fast block decode — ~5x; falls back to pure python without it)
 - `numpy` (fast ESE checksums; falls back without it)
