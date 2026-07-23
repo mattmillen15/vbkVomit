@@ -1,7 +1,6 @@
 # vbkvomit
 
-Pull domain hashes straight out of a Veeam `.vbk` backup. No Veeam, no wine, no NBD, no
-ntfs-3g. Point it at a backup, get `secretsdump` output.
+Pull domain hashes straight out of a Veeam `.vbk` backup.
 
 It reads the VBK directly, finds the NTFS volume inside, walks the MFT, reassembles
 `ntds.dit` + `SAM`/`SECURITY`/`SYSTEM`, and runs impacket `secretsdump`.
