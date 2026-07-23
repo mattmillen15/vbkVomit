@@ -1521,6 +1521,31 @@ _FAST_TARGETS = {   # output name -> candidate NTFS paths
 _NTFS_VBR = b"\xeb\x52\x90NTFS    "
 
 
+def _count_stored_fib_blocks(df):
+    """Return (stored, total) FIB block counts for a FibStream, or (-1, -1) on error."""
+    try:
+        t = df.table
+        total = t.count
+        stored = 0
+        for td in t._vec:
+            if td.page == -1:
+                continue
+            try:
+                pv = t._open_table(td.page, td.count)
+                for ei in range(td.count):
+                    try:
+                        bd = pv.get(ei)
+                        if int(bd.type) != 1:
+                            stored += 1
+                    except Exception:
+                        break
+            except Exception:
+                continue
+        return stored, total
+    except Exception:
+        return -1, -1
+
+
 def _extract_via_dissect(vbk_path, work, want_ntds):
     """Open the VBK with dissect, resolve dedup blocks by digest, mount its
     NTFS volume(s), and extract the target hives + ntds.dit into `work`.
@@ -1576,6 +1601,7 @@ def _extract_via_dissect(vbk_path, work, want_ntds):
     if not want_ntds:
         want.pop("ntds.dit", None)
     found = {}
+    sparse_disks = []  # collect (name, stored_count) for incremental diagnosis
     for folder in v.root.iterdir():
         for item in folder.iterdir():
             try:
@@ -1590,9 +1616,16 @@ def _extract_via_dissect(vbk_path, work, want_ntds):
                 df = item.open(); size = item.size
             except Exception:
                 continue
+
+            # Quick sparse-VBK check: detect incrementals by stored-block ratio
+            stored_blocks, total_blocks = _count_stored_fib_blocks(df)
+            if stored_blocks >= 0 and total_blocks > 0 and stored_blocks / total_blocks < 0.05:
+                sparse_disks.append((item.name, stored_blocks, total_blocks))
+
             # NTFS volume offsets: MBR partitions, else scan for VBRs
             starts = []
             try:
+                df.seek(0)
                 mbr = df.read(512)
                 if mbr[510:512] == b"\x55\xaa":
                     for pi in range(4):
@@ -1628,6 +1661,14 @@ def _extract_via_dissect(vbk_path, work, want_ntds):
                         except Exception:
                             continue
     print(f"[*] extraction done ({time.time()-t0:.1f}s)")
+
+    if not found and sparse_disks:
+        for disk_name, sc, tot in sparse_disks:
+            pct = sc * 100 // tot
+            print(f"  [!] Disk {disk_name}: {sc}/{tot} blocks stored ({pct}%)")
+            print(f"      Incremental backup — credential files are in the previous full")
+            print(f"      VBK in the chain. Run against that file to extract credentials.")
+
     return found
 
 
