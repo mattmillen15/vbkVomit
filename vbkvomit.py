@@ -1530,6 +1530,16 @@ def _extract_via_dissect(vbk_path, work, want_ntds):
     from dissect.util.compression import lz4 as _lz4
     from dissect.util.stream import RangeStream
     from dissect.ntfs import NTFS
+    from dissect.ntfs.exceptions import BrokenIndexError as _BrokenIndexError
+
+    class _RobustNTFS(NTFS):
+        """NTFS subclass that survives BrokenIndexError in $Secure/$Usnjrnl init.
+        The MFT is fully loaded before those fail, so path lookups still work."""
+        def __init__(self, *a, **kw):
+            try:
+                super().__init__(*a, **kw)
+            except _BrokenIndexError:
+                pass
 
     t0 = time.time()
     fh = open(vbk_path, "rb")
@@ -1601,7 +1611,7 @@ def _extract_via_dissect(vbk_path, work, want_ntds):
                         break
             for start in starts:
                 try:
-                    ntfs = NTFS(RangeStream(df, start, size - start))
+                    ntfs = _RobustNTFS(RangeStream(df, start, size - start))
                 except Exception:
                     continue
                 for out_name, paths in want.items():
@@ -2081,7 +2091,6 @@ Examples:
     out_dir = Path(args.out_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
     print(f"[*] Loot dir: {out_dir}")
-    print(f"[*] Cache:    {CACHE_DIR}")
 
     if args.local_path is not None:
         run_local(args, sd, out_dir)
