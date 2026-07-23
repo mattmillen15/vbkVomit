@@ -1199,13 +1199,130 @@ def _target_kind(path):
 
 # ═══ Full-extract path (--full-extract): dump raw disk image via dissect ══════
 
+def _vhd_footer(disk_size):
+    """Build a 512-byte Fixed VHD footer per the Microsoft VHD spec."""
+    import struct, uuid, time as _time
+    # CHS geometry (Microsoft VHD spec algorithm)
+    total_sec = disk_size // 512
+    if total_sec > 65535 * 16 * 255:
+        total_sec = 65535 * 16 * 255
+    if total_sec >= 65535 * 16 * 63:
+        spt, heads = 255, 16
+        cyls = total_sec // (heads * spt)
+    else:
+        spt = 17
+        cyls = total_sec // spt
+        heads = max(4, (cyls + 1023) // 1024)
+        if cyls >= 1024 * heads:
+            spt, heads = 31, 16
+            cyls = total_sec // (spt * heads)
+        if cyls >= 1024 * heads:
+            spt, heads = 63, 16
+            cyls = total_sec // (spt * heads)
+        if cyls >= 1024 * heads:
+            cyls = 1023
+    cyls = min(cyls, 65535)
+
+    footer = bytearray(512)
+    footer[0:8]   = b"conectix"
+    struct.pack_into(">I", footer,  8, 0x00000002)          # features
+    struct.pack_into(">I", footer, 12, 0x00010000)          # format version 1.0
+    struct.pack_into(">Q", footer, 16, 0xFFFFFFFFFFFFFFFF)  # data offset (fixed)
+    struct.pack_into(">I", footer, 24, max(0, int(_time.time()) - 946684800))  # vhd epoch
+    footer[28:32] = b"win "
+    struct.pack_into(">I", footer, 32, 0x000A0000)          # creator ver 10.0
+    footer[36:40] = b"Wi2k"
+    struct.pack_into(">Q", footer, 40, disk_size)           # original size
+    struct.pack_into(">Q", footer, 48, disk_size)           # current size
+    footer[52] = (cyls >> 8) & 0xFF
+    footer[53] = cyls & 0xFF
+    footer[54] = heads & 0xFF
+    footer[55] = spt & 0xFF
+    struct.pack_into(">I", footer, 56, 2)                   # disk type: fixed
+    footer[60:64] = b"\x00\x00\x00\x00"                    # checksum placeholder
+    footer[64:80] = uuid.uuid4().bytes
+    csum = (~sum(footer)) & 0xFFFFFFFF
+    struct.pack_into(">I", footer, 60, csum)
+    return bytes(footer)
+
+
+def _vbk_encrypted(vbk_path):
+    """Quick encryption probe — returns True/False/None (None = undetermined).
+    Checks keyset_id on FIB block descriptors (non-zero = encrypted key set),
+    then falls back to a single LZ4 decompression attempt."""
+    try:
+        from dissect.archive import vbk as _vbk
+        from dissect.archive.vbk import FibStream
+        from dissect.util.compression import lz4 as _lz4
+    except ImportError:
+        return None
+
+    NULL_KID = b"\x00" * 16
+    try:
+        with open(vbk_path, "rb") as fh:
+            v = _vbk.VBK(fh)
+            h2blk = {}
+            for i in range(min(100, v.block_store.count)):
+                sd = v.block_store.get(i)
+                h2blk[bytes(sd.digest)] = sd
+            FibStream._read = lambda self, o, n: b""   # stub; we only use .table.get()
+            for folder in v.root.iterdir():
+                for item in folder.iterdir():
+                    try:
+                        if item.is_dir() or item.size < (16 << 20):
+                            continue
+                    except Exception:
+                        continue
+                    nm = item.name.lower()
+                    if nm.endswith((".xml", ".zip")) or nm.startswith("digest_"):
+                        continue
+                    df = item.open()
+                    probe = min(16, (item.size + v.block_size - 1) // v.block_size)
+                    # Primary: keyset_id on FIB descriptor (no I/O, definitive)
+                    for bi in range(probe):
+                        try:
+                            bd = df.table.get(bi)
+                            if hasattr(bd, "keyset_id"):
+                                kid = bytes(bd.keyset_id)
+                                if len(kid) == 16:
+                                    return kid != NULL_KID
+                        except Exception:
+                            continue
+                    # Fallback: try decompressing one block
+                    for bi in range(probe):
+                        try:
+                            bd = df.table.get(bi)
+                            if int(bd.type) == 1:
+                                continue
+                            sd = h2blk.get(bytes(bd.digest))
+                            if sd is None:
+                                continue
+                            with open(vbk_path, "rb") as fh2:
+                                fh2.seek(sd.offset)
+                                raw = fh2.read(sd.compressed_size)
+                            if sd.is_compressed():
+                                _lz4.decompress(memoryview(raw)[12:], sd.source_size)
+                            return False
+                        except Exception:
+                            return True
+    except Exception:
+        pass
+    return None
+
+
 def _dump_images_via_dissect(vbk_path, out_dir):
-    """Stream every disk stored in a VBK to out_dir as a raw .img file.
-    Uses dissect's content-addressed block resolver — same as --fast but writes
-    the entire volume instead of specific files."""
+    """Stream every disk stored in a VBK to out_dir as VHD/VHDX.
+    Uses a parallel sliding-window pipeline: WORKERS threads fetch+decompress
+    blocks from the VBK while the main thread writes, overlapping I/O and CPU."""
     from dissect.archive import vbk as _vbk
     from dissect.archive.vbk import FibStream
     from dissect.util.compression import lz4 as _lz4
+    from concurrent.futures import ThreadPoolExecutor
+    from collections import deque
+    import queue as _queue
+
+    WORKERS = 4          # parallel fetch+decompress threads
+    WINDOW  = WORKERS * 4  # futures kept in flight ahead of the write cursor
 
     fh = open(vbk_path, "rb")
     v = _vbk.VBK(fh)
@@ -1216,6 +1333,7 @@ def _dump_images_via_dissect(vbk_path, out_dir):
         h2blk[bytes(sd.digest)] = sd
     print(f"[*] {len(h2blk)} blocks in digest map")
 
+    # Kept for the 8-byte magic peek (df.seek/read only, not the hot path)
     def _read(self, offset, length):
         result = []; bs = self.vbk.block_size
         while length > 0:
@@ -1237,8 +1355,7 @@ def _dump_images_via_dissect(vbk_path, out_dir):
     FibStream._read = _read
 
     images = []
-    CHUNK = 1 << 20
-    ZEROS = b"\x00" * CHUNK
+    ZEROS = b"\x00" * (1 << 20)
 
     for folder in v.root.iterdir():
         for item in folder.iterdir():
@@ -1251,39 +1368,100 @@ def _dump_images_via_dissect(vbk_path, out_dir):
             if nm.endswith((".xml", ".zip")) or nm.startswith("digest_"):
                 continue
             size = item.size
-            out_path = out_dir / (Path(item.name).stem + ".img")
-            print(f"[*] Dumping {item.name} ({size / (1 << 30):.1f} GB) → {out_path}")
             try:
                 df = item.open()
-                df.seek(0)
-                t0 = time.time(); pos = 0; sparse_bytes = 0
-                with open(out_path, "wb") as img:
-                    while pos < size:
-                        n = min(CHUNK, size - pos)
-                        chunk = df.read(n)
-                        if len(chunk) < n:
-                            chunk += b"\x00" * (n - len(chunk))
-                        if chunk == ZEROS[:n]:
-                            img.seek(n, 1)
-                            sparse_bytes += n
+                df.seek(0); magic = df.read(8); df.seek(0)
+                is_vhdx = magic == b"vhdxfile"
+                ext = ".vhdx" if is_vhdx else ".vhd"
+                out_path = out_dir / (Path(item.name).stem + ext)
+                fmt_label = "VHDX (native)" if is_vhdx else "VHD (fixed)"
+                print(f"[*] Dumping {item.name} ({size/(1<<30):.1f} GB, {fmt_label}) → {out_path}")
+
+                # Pre-scan the block address table — one pass, memory only
+                bs = v.block_size
+                num_blocks = (size + bs - 1) // bs
+                block_sds = []  # None → zero block, else → block store descriptor
+                for bi in range(num_blocks):
+                    bd = df.table.get(bi)
+                    block_sds.append(None if int(bd.type) == 1
+                                     else h2blk.get(bytes(bd.digest)))
+
+                # Pool of WORKERS open file handles — avoids open()/close() per block
+                _fh_q = _queue.SimpleQueue()
+                _fhs = [open(vbk_path, "rb") for _ in range(WORKERS)]
+                for _f in _fhs:
+                    _fh_q.put(_f)
+
+                def _fetch(sd):
+                    _fh = _fh_q.get()
+                    try:
+                        _fh.seek(sd.offset)
+                        raw = _fh.read(sd.compressed_size)
+                        return (_lz4.decompress(memoryview(raw)[12:], sd.source_size)
+                                if sd.is_compressed() else raw)
+                    finally:
+                        _fh_q.put(_fh)
+
+                try:
+                    t0 = time.time(); pos = 0; sparse_bytes = 0
+                    with ThreadPoolExecutor(max_workers=WORKERS) as pool, \
+                         open(out_path, "wb") as img:
+                        pending = deque()
+                        submit_at = 0
+
+                        def advance():
+                            nonlocal submit_at
+                            while submit_at < num_blocks and len(pending) < WINDOW:
+                                sd = block_sds[submit_at]
+                                pending.append(None if sd is None
+                                               else pool.submit(_fetch, sd))
+                                submit_at += 1
+
+                        advance()
+                        for _ in range(num_blocks):
+                            advance()
+                            fut = pending.popleft()
+                            expected = min(bs, size - pos)
+                            if fut is None:
+                                chunk = ZEROS[:expected]
+                            else:
+                                chunk = fut.result()
+                                if len(chunk) != expected:
+                                    chunk = (chunk + b"\x00" * expected)[:expected]
+
+                            if chunk == ZEROS[:expected]:
+                                img.seek(expected, 1)
+                                sparse_bytes += expected
+                            else:
+                                img.write(chunk)
+                            pos += expected
+
+                            if pos % (128 << 20) == 0 or pos >= size:
+                                elapsed = time.time() - t0
+                                mbps = (pos >> 20) / max(elapsed, 0.1)
+                                eta = ((size - pos) >> 20) / max(mbps, 0.1)
+                                print(f"    {100*pos//size}%  {pos/(1<<30):.1f}/{size/(1<<30):.1f} GB"
+                                      f"  {mbps:.0f} MB/s  ETA {eta:.0f}s      ", end="\r")
+
+                        if is_vhdx:
+                            img.truncate(size)
                         else:
-                            img.write(chunk)
-                        pos += n
-                        if pos % (128 << 20) == 0 or pos >= size:
-                            elapsed = time.time() - t0
-                            mbps = (pos >> 20) / max(elapsed, 0.1)
-                            eta = ((size - pos) >> 20) / max(mbps, 0.1)
-                            print(f"    {100*pos//size}%  {pos/(1<<30):.1f}/{size/(1<<30):.1f} GB"
-                                  f"  {mbps:.0f} MB/s  ETA {eta:.0f}s      ", end="\r")
-                    img.truncate(size)
+                            img.truncate(size)
+                            img.write(_vhd_footer(size))
+                finally:
+                    for _f in _fhs:
+                        try: _f.close()
+                        except: pass
+
                 print(f"\n  [+] {out_path} "
                       f"({size/(1<<30):.1f} GB, {sparse_bytes/(1<<30):.1f} GB sparse, "
                       f"{time.time()-t0:.1f}s)")
-                print(f"  [*] Mount hints:")
-                print(f"        sudo losetup -fP --show {out_path}")
-                print(f"        # -P exposes partitions as /dev/loopNp1, p2, ...")
-                print(f"        # sudo mount -o ro /dev/loopNpX /mnt/img")
-                print(f"        # or direct (no MBR): sudo mount -o loop,ro {out_path} /mnt/img")
+                print(f"  [*] Mount hints (Linux):")
+                print(f"        sudo modprobe nbd")
+                print(f"        sudo qemu-nbd -c /dev/nbd0 {out_path}")
+                print(f"        sudo partprobe /dev/nbd0")
+                print(f"        sudo mount -o ro /dev/nbd0p1 /mnt/vhd")
+                print(f"  [*] Mount hints (Windows): Disk Management → Action → Attach VHD/VHDX")
                 images.append(out_path)
             except Exception as e:
                 print(f"\n  [!] Dump failed: {e}")
@@ -1454,16 +1632,24 @@ def _process_vbk_fast(vbk_path, sd_path, work, want_ntds):
 
 
 def process_vbk(vbk_path, sd_path, out_dir, label=None, want_ntds=False, fast=False,
-                full_extract=False):
+                full_extract=False, extract_dir=None):
     label = label or Path(vbk_path).stem
     print(f"\n{'='*72}")
     print(f"[*] Processing {vbk_path}  ({size_str(vbk_path)})")
     print(f"{'='*72}")
+    enc = _vbk_encrypted(vbk_path)
+    if enc is True:
+        print("[!] ENCRYPTED — this VBK is password-protected. Extraction will fail.")
+        print("    Veeam encryption uses AES-256; the key is not recoverable without the backup password.")
+    elif enc is False:
+        print("[*] Encryption: not encrypted")
     work = Path(out_dir) / label
     work.mkdir(parents=True, exist_ok=True)
 
     if full_extract:
-        return _process_vbk_full_extract(vbk_path, work)
+        img_dir = Path(extract_dir) / label if extract_dir else work
+        img_dir.mkdir(parents=True, exist_ok=True)
+        return _process_vbk_full_extract(vbk_path, img_dir)
 
     if fast:
         return _process_vbk_fast(vbk_path, sd_path, work, want_ntds)
@@ -1772,8 +1958,9 @@ def run_smb(args, sd_path, out_dir):
         vbks = find_vbk_files(scan_paths, workers=args.workers)
         if not vbks: print("[!] No VBK files found"); return
         for vbk in select_vbk(vbks):
-            process_vbk(vbk, sd_path, out_dir, want_ntds=args.ntds, fast=args.fast,
-                        full_extract=args.full_extract)
+            process_vbk(vbk, sd_path, out_dir, want_ntds=args.ntds,
+                        fast=(args.mode == "fast"), full_extract=(args.mode == "full-extract"),
+                        extract_dir=args.extract_dir)
         print("\n[+] Done")
     finally:
         for m in mounted:
@@ -1797,12 +1984,14 @@ def run_local(args, sd_path, out_dir):
         vbks.extend(find_vbk_files(dirs, workers=args.workers))
     if not vbks: print("[!] No VBK files found"); return
     if len(vbks) == 1:
-        process_vbk(vbks[0], sd_path, out_dir, want_ntds=args.ntds, fast=args.fast,
-                    full_extract=args.full_extract)
+        process_vbk(vbks[0], sd_path, out_dir, want_ntds=args.ntds,
+                    fast=(args.mode == "fast"), full_extract=(args.mode == "full-extract"),
+                    extract_dir=args.extract_dir)
     else:
         for vbk in select_vbk(vbks):
-            process_vbk(vbk, sd_path, out_dir, want_ntds=args.ntds, fast=args.fast,
-                        full_extract=args.full_extract)
+            process_vbk(vbk, sd_path, out_dir, want_ntds=args.ntds,
+                        fast=(args.mode == "fast"), full_extract=(args.mode == "full-extract"),
+                        extract_dir=args.extract_dir)
     print("\n[+] Done")
 
 
@@ -1819,6 +2008,8 @@ Examples:
   SMB specific path: %(prog)s -t 192.168.15.151 --path "lab/VeeamBackups"
   Local directory:   %(prog)s --local-path /mnt/backups
   Single VBK file:   %(prog)s --local-path /tmp/dc_backup.vbk
+  MFT scan mode:     %(prog)s --local-path /tmp/dc_backup.vbk -m mft
+  Full VHD dump:     %(prog)s --local-path /tmp/dc_backup.vbk -m full-extract --extract-dir /mnt/lab/VeeamBackups
         """,
     )
     mode = p.add_mutually_exclusive_group(required=True)
@@ -1834,6 +2025,9 @@ Examples:
     p.add_argument("--out-dir", default=str(BASE_DIR / "vbkvomit_loot"),
                    help="Where to save extracted hives + secretsdump output "
                         "(default: vbkvomit_loot/ next to the tool)")
+    p.add_argument("--extract-dir", default=None, metavar="DIR",
+                   help="Output directory for raw disk images when using -m full-extract. "
+                        "Defaults to --out-dir if not set.")
     p.add_argument("--workers", type=int, default=10,
                    help="Threads for parallel VBK scanning")
     p.add_argument("--no-ntds", dest="ntds", action="store_false",
@@ -1841,16 +2035,14 @@ Examples:
                         "ntds.dit (DC backups) it is extracted and dumped "
                         "automatically — runs are located by ESE-checksum "
                         "content matching, so the DB dumps cleanly.")
-    p.add_argument("--fast", action="store_true",
-                   help="EXPERIMENTAL: use the dissect library to resolve the "
-                        "VBK's dedup blocks by digest and read files directly "
-                        "(~5-15x faster, no scan). Needs 'pip install dissect'. "
-                        "Falls back guidance printed if unavailable.")
-    p.add_argument("--full-extract", action="store_true",
-                   help="Dump complete raw disk image(s) from the VBK to the output "
-                        "directory as .img files. Uses dissect (pip install dissect). "
-                        "Images can be mounted with 'sudo losetup -fP --show <img>'. "
-                        "Useful when targeted extraction fails (e.g. unusual VBK layout).")
+    p.add_argument("-m", "--mode",
+                   choices=["fast", "mft", "full-extract"], default="fast",
+                   help="Extraction mode (default: fast). "
+                        "fast: dissect-based direct extraction, ~5-15x faster than mft scan — needs 'pip install dissect'. "
+                        "mft: walk the NTFS MFT in raw VBK blocks, no dissect required. "
+                        "full-extract: dump disk(s) from the VBK as Fixed VHD files via dissect "
+                        "(same format as Veeam extract.exe). Mount on Linux with qemu-nbd, "
+                        "or attach directly in Windows Disk Management.")
     args = p.parse_args()
 
     if args.target is not None:

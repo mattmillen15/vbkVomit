@@ -22,18 +22,31 @@ Use `--no-ntds` to skip it.
 Loot + scan caches land in `vbkvomit_loot/` and `vbkvomit_cache/` next to the script.
 Re-running against the same backup is instant (it's all cached).
 
-### `--fast` (experimental, ~5–15x faster)
+## Extraction modes (`-m`)
 
 ```bash
-python3 vbkvomit.py --local-path /mnt/backups/dc.vbk --fast   # needs: pip install dissect
+python3 vbkvomit.py --local-path /mnt/backups/dc.vbk            # fast (default)
+python3 vbkvomit.py --local-path /mnt/backups/dc.vbk -m mft     # MFT scan fallback
+python3 vbkvomit.py --local-path /mnt/backups/dc.vbk -m full-extract --extract-dir /tmp/images
 ```
 
-Instead of the hand-rolled scan+reassembly, `--fast` uses Fox-IT's [`dissect`](https://github.com/fox-it/dissect)
-library to resolve the VBK's content-addressed (deduplicated) blocks by their digest, mount
-the embedded NTFS volume, and read the files directly — no block search. Cold run drops from
-~40 s to ~8 s on our sample (full DC dump, identical output). It's opt-in while the default
-reassembler stays the proven path; if `dissect` isn't installed it prints install guidance
-and you just drop `--fast`.
+| Mode | What it does | Needs |
+|------|-------------|-------|
+| `fast` (default) | Uses `dissect` to resolve dedup blocks by digest and read target files directly. ~5–15x faster than `mft`. | `pip install dissect` |
+| `mft` | Hand-rolled scan: walks the raw VBK blocks, finds NTFS MFT, reassembles hives. No extra deps, proven path. | — |
+| `full-extract` ⚠️ | **EXPERIMENTAL.** Dumps every disk in the VBK as a VHD/VHDX file. Detects format from stream magic (`vhdxfile` → VHDX passthrough, otherwise Fixed VHD with spec-compliant footer). Uses a 4-worker parallel fetch pipeline. | `pip install dissect` |
+
+### `full-extract` notes
+
+- **Write to local disk.** If the VBK is on a NAS share and `--extract-dir` also points there,
+  reads and writes fight over the same network link (~125 MB/s on 1Gbps). Use
+  `--extract-dir /tmp/` or a local drive for the write path — you'll typically see 2–3×
+  the throughput.
+- Output format is auto-detected per disk: VHDX streams pass through as-is; raw sector
+  streams get a Fixed VHD footer appended (matches Veeam `extract.exe` output).
+- Marked experimental because VBK layout varies across Veeam versions and backup types
+  (agent vs Hyper-V VM vs VMware). The fast/mft credential extraction paths are the
+  validated ones.
 
 ## How it works
 
@@ -49,4 +62,4 @@ directory (~5 MB) to know where everything is.
 - `cifs-utils` (for `-t` SMB mode)
 - `lz4` (fast block decode — ~5x; falls back to pure python without it)
 - `numpy` (fast ESE checksums; falls back without it)
-- `dissect` (only for `--fast`; `pip install dissect`)
+- `dissect` (for `fast` and `full-extract` modes; `pip install dissect`)
