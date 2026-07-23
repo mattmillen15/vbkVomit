@@ -35,7 +35,7 @@ __     ______  _  __ __     _____  __  __ ___ _____
   \ V / | |_) | . \    \ V /| |_| | |  | || |  | |
    \_/  |____/|_|\_\    \_/  \___/|_|  |_|___| |_|
 
-  VBK → NTFS MFT walk → SAM/SECURITY hive reassembly → secretsdump
+  read VBK directly → extract creds → no Veeam, no NBD, no wine
 """
 
 try:
