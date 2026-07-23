@@ -1,0 +1,11 @@
+# Required for SMB enumeration and authentication
+impacket
+
+# Required for fast extraction mode (-m fast, default)
+dissect
+
+# Optional: accelerates LZ4 block decompression (~5x); falls back to pure Python
+lz4
+
+# Optional: accelerates ESE page checksum verification; falls back to pure Python
+numpy

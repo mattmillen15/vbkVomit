@@ -1521,6 +1521,215 @@ _FAST_TARGETS = {   # output name -> candidate NTFS paths
 _NTFS_VBR = b"\xeb\x52\x90NTFS    "
 
 
+def _mft_scan_v9(df, partition_offset, work, want):
+    """
+    Direct MFT record scan for v9-format VBKs where directory INDX traversal fails.
+
+    Reads $MFT record 0 to get the complete MFT run list (handles fragmented MFT),
+    then iterates every record in every extent looking for target filenames without
+    touching any INDX/directory-index blocks.  For each match the data runs are
+    read via the FibStream; a 'regf' magic check rejects sparse/zero results so
+    incremental VBKs that don't contain the file data return empty-handed cleanly.
+
+    Returns {output_name: Path} for each file successfully extracted.
+    """
+    try:
+        df.seek(partition_offset)
+        vbr = df.read(512)
+    except Exception:
+        return {}
+    if vbr[3:11] != b"NTFS    ":
+        return {}
+
+    bps = struct.unpack_from("<H", vbr, 11)[0]   # bytes per sector
+    cs  = bps * vbr[13]                           # cluster size
+    mft_lcn = struct.unpack_from("<Q", vbr, 48)[0]
+    raw_cpfrs = vbr[64]                           # clusters-per-file-record (unsigned)
+    rs = 2 ** (256 - raw_cpfrs) if raw_cpfrs >= 128 else raw_cpfrs * cs
+    rs = max(int(rs), 512)                        # record size, floor 512 bytes
+
+    mft_start = partition_offset + mft_lcn * cs
+
+    def parse_runs(data):
+        """NTFS run list → [(lcn_or_None, cluster_count)]."""
+        runs, pos, cur = [], 0, 0
+        while pos < len(data):
+            hdr = data[pos]; pos += 1
+            if hdr == 0:
+                break
+            ls = hdr & 0x0F; os = (hdr >> 4) & 0x0F
+            if pos + ls + os > len(data):
+                break
+            rlen = int.from_bytes(data[pos:pos + ls], "little") if ls else 0
+            pos += ls
+            if os:
+                raw = data[pos:pos + os]
+                delta = int.from_bytes(raw, "little")
+                if raw[-1] & 0x80:
+                    delta -= (1 << (os * 8))
+                cur += delta
+                runs.append((cur, rlen))
+            else:
+                runs.append((None, rlen))   # sparse / hole
+            pos += os
+        return runs
+
+    def fixup(raw):
+        """Apply NTFS update-sequence fix-ups (sector boundary protection)."""
+        if len(raw) < 10 or raw[:4] != b"FILE":
+            return raw
+        usn_off = struct.unpack_from("<H", raw, 4)[0]
+        cnt     = struct.unpack_from("<H", raw, 6)[0]
+        if usn_off + cnt * 2 > len(raw):
+            return raw
+        rec = bytearray(raw)
+        check = bytes(rec[usn_off:usn_off + 2])
+        for i in range(1, cnt):
+            end = i * bps - 2
+            if end + 2 > len(rec):
+                break
+            if bytes(rec[end:end + 2]) == check:
+                rec[end]     = rec[usn_off + i * 2]
+                rec[end + 1] = rec[usn_off + i * 2 + 1]
+        return bytes(rec)
+
+    def get_filename(rec):
+        """Return lowercase filename from best $FILE_NAME attribute (skip 8.3)."""
+        attr_off = struct.unpack_from("<H", rec, 20)[0]
+        best = None
+        while attr_off + 8 <= len(rec):
+            at = struct.unpack_from("<I", rec, attr_off)[0]
+            if at == 0xFFFFFFFF:
+                break
+            al = struct.unpack_from("<I", rec, attr_off + 4)[0]
+            if al < 8 or attr_off + al > len(rec):
+                break
+            if at == 0x30 and rec[attr_off + 8] == 0:   # resident $FILE_NAME
+                co = struct.unpack_from("<H", rec, attr_off + 20)[0]
+                fo = attr_off + co
+                if fo + 66 <= len(rec):
+                    fnl = rec[fo + 64]; ns = rec[fo + 65]
+                    fn  = rec[fo + 66:fo + 66 + fnl * 2].decode("utf-16-le", errors="replace").lower()
+                    if fn:
+                        if ns in (1, 3):   # Win32 or Win32+DOS — take immediately
+                            return fn
+                        best = fn          # POSIX — keep looking for Win32
+            attr_off += al
+        return best
+
+    def get_data_attr(rec):
+        """Return (runs_or_bytes, file_size) from $DATA attribute."""
+        attr_off = struct.unpack_from("<H", rec, 20)[0]
+        while attr_off + 8 <= len(rec):
+            at = struct.unpack_from("<I", rec, attr_off)[0]
+            if at == 0xFFFFFFFF:
+                break
+            al = struct.unpack_from("<I", rec, attr_off + 4)[0]
+            if al < 8 or attr_off + al > len(rec):
+                break
+            if at == 0x80:
+                if rec[attr_off + 8] == 0:   # resident
+                    co  = struct.unpack_from("<H", rec, attr_off + 20)[0]
+                    cl  = struct.unpack_from("<I", rec, attr_off + 16)[0]
+                    return rec[attr_off + co:attr_off + co + cl], cl
+                else:                        # non-resident
+                    run_off = struct.unpack_from("<H", rec, attr_off + 32)[0]
+                    fsz     = struct.unpack_from("<Q", rec, attr_off + 48)[0]
+                    runs    = parse_runs(rec[attr_off + run_off:attr_off + al])
+                    return runs, fsz
+            attr_off += al
+        return None, 0
+
+    def read_content(runs_or_data, fsz):
+        """Assemble file content from a run list (or resident bytes)."""
+        if isinstance(runs_or_data, (bytes, bytearray)):
+            return bytes(runs_or_data[:fsz])
+        chunks, remaining = [], fsz
+        for lcn, cnt in runs_or_data:
+            nbytes = min(cnt * cs, remaining)
+            if lcn is None or lcn < 0:
+                chunks.append(b"\x00" * nbytes)
+            else:
+                try:
+                    df.seek(partition_offset + lcn * cs)
+                    chunks.append(df.read(nbytes))
+                except Exception:
+                    chunks.append(b"\x00" * nbytes)
+            remaining -= nbytes
+            if remaining <= 0:
+                break
+        return b"".join(chunks)
+
+    # --- Step 1: read $MFT record 0 → get the complete MFT run list ---------------
+    try:
+        df.seek(mft_start)
+        mft_runs, mft_size = get_data_attr(fixup(df.read(rs)))
+    except Exception:
+        return {}
+    if not isinstance(mft_runs, list) or not mft_runs:
+        return {}   # $MFT must be non-resident; resident = something is very wrong
+
+    # --- Step 2: build target filename → output_name map -------------------------
+    fname_map = {}
+    for out_name in want:
+        key = out_name.lower().replace(".hive", "")
+        fname_map[key] = out_name
+    # 'ntds.dit' → key = 'ntds.dit' (already correct after .replace)
+
+    found = {}
+    total_records = mft_size // rs if rs else 0
+    print(f"  [*] v9 MFT scan: {len(mft_runs)} run(s), ~{total_records:,} records")
+
+    # --- Step 3: iterate every MFT record across all extents ---------------------
+    for lcn, cnt in mft_runs:
+        if len(found) >= len(want):
+            break
+        if lcn is None or lcn < 0:
+            continue   # sparse MFT run — skip
+        run_base = partition_offset + lcn * cs
+        n_records = (cnt * cs) // rs
+        for i in range(n_records):
+            if len(found) >= len(want):
+                break
+            try:
+                df.seek(run_base + i * rs)
+                raw = df.read(rs)
+            except Exception:
+                break
+            if raw[:4] != b"FILE":
+                continue
+            rec = fixup(raw)
+            if not (struct.unpack_from("<H", rec, 22)[0] & 1):
+                continue   # record not in use
+            fname = get_filename(rec)
+            if not fname or fname not in fname_map:
+                continue
+            out_name = fname_map[fname]
+            if out_name in found:
+                continue
+            data_or_runs, fsz = get_data_attr(rec)
+            if data_or_runs is None or fsz < 4096:
+                continue
+            try:
+                content = read_content(data_or_runs, fsz)
+            except Exception:
+                continue
+            # Reject sparse/empty blocks: registry hives must start with 'regf';
+            # for ntds.dit we check that the first 64 bytes aren't all zeros.
+            if out_name.endswith(".hive"):
+                if content[:4] != b"regf":
+                    continue
+            else:
+                if not any(b != 0 for b in content[:64]):
+                    continue
+            dst = work / out_name
+            dst.write_bytes(content)
+            found[out_name] = dst
+            print(f"  [+] {out_name} ({len(content):,} bytes) via MFT scan")
+
+    return found
+
+
 def _count_stored_fib_blocks(df):
     """Return (stored, total) FIB block counts for a FibStream, or (-1, -1) on error."""
     try:
@@ -1647,6 +1856,9 @@ def _extract_via_dissect(vbk_path, work, want_ntds):
                     ntfs = _RobustNTFS(RangeStream(df, start, size - start))
                 except Exception:
                     continue
+                # Try dissect NTFS path lookup first; if INDX blocks are sparse
+                # (v9 format), _BrokenIndexError is raised → fall back to MFT scan.
+                _broken = False
                 for out_name, paths in want.items():
                     if out_name in found:
                         continue
@@ -1658,8 +1870,18 @@ def _extract_via_dissect(vbk_path, work, want_ntds):
                             found[out_name] = dst
                             print(f"  [+] {out_name} ({len(data):,} bytes) from disk {item.name}")
                             break
+                        except _BrokenIndexError:
+                            _broken = True
+                            break
                         except Exception:
                             continue
+                    if _broken:
+                        break
+                if _broken and set(want) - set(found):
+                    # v9 VBK: directory INDX blocks sparse, NTFS traversal fails.
+                    # Scan MFT records directly by filename — no INDX access needed.
+                    remaining = {k: v for k, v in want.items() if k not in found}
+                    found.update(_mft_scan_v9(df, start, work, remaining))
     print(f"[*] extraction done ({time.time()-t0:.1f}s)")
 
     if not found and sparse_disks:
