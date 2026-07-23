@@ -1254,8 +1254,30 @@ def _vhd_footer(disk_size):
 
 def _vbk_encrypted(vbk_path):
     """Quick encryption probe — returns True/False/None (None = undetermined).
-    Checks keyset_id on FIB block descriptors (non-zero = encrypted key set),
-    then falls back to a single LZ4 decompression attempt."""
+
+    Check order:
+    1. Sibling .vbm XML file — EncryptionState != 0 is definitive, no I/O on the VBK.
+    2. keyset_id on FIB block descriptors (dissect, no block I/O).
+    3. Single LZ4 decompression attempt (dissect fallback).
+    If dissect itself crashes parsing the VBK structure that also indicates encryption.
+    """
+    import re as _re
+
+    # --- 1. VBM sidecar (fastest, works even when the VBK is unreadable) ---
+    vbk_p = Path(vbk_path)
+    for vbm in vbk_p.parent.glob("*.vbm"):
+        try:
+            m = _re.search(rb'EncryptionState="(\d+)"', vbm.read_bytes())
+            if m:
+                state = int(m.group(1))
+                if state == 2:   return True   # encrypted
+                if state == 0:   return False  # plaintext
+                # state == 1: encryption key configured but not applied to this run
+                # fall through to dissect checks
+        except Exception:
+            continue
+
+    # --- 2 & 3. Dissect-based block-level checks ---
     try:
         from dissect.archive import vbk as _vbk
         from dissect.archive.vbk import FibStream
@@ -1284,7 +1306,6 @@ def _vbk_encrypted(vbk_path):
                         continue
                     df = item.open()
                     probe = min(16, (item.size + v.block_size - 1) // v.block_size)
-                    # Primary: keyset_id on FIB descriptor (no I/O, definitive)
                     for bi in range(probe):
                         try:
                             bd = df.table.get(bi)
@@ -1294,7 +1315,6 @@ def _vbk_encrypted(vbk_path):
                                     return kid != NULL_KID
                         except Exception:
                             continue
-                    # Fallback: try decompressing one block
                     for bi in range(probe):
                         try:
                             bd = df.table.get(bi)
@@ -1312,7 +1332,10 @@ def _vbk_encrypted(vbk_path):
                         except Exception:
                             return True
     except Exception:
-        pass
+        # dissect crashed parsing the VBK — encrypted VBKs have encrypted metadata
+        # that dissect can't traverse, so a parse crash is a strong encryption signal
+        # if the VBM check above didn't already give us a definitive answer.
+        return True
     return None
 
 
@@ -1645,8 +1668,9 @@ def process_vbk(vbk_path, sd_path, out_dir, label=None, want_ntds=False, fast=Fa
     print(f"{'='*72}")
     enc = _vbk_encrypted(vbk_path)
     if enc is True:
-        print("[!] ENCRYPTED — this VBK is password-protected. Extraction will fail.")
+        print("[!] ENCRYPTED — this VBK is password-protected. Extraction not possible.")
         print("    Veeam encryption uses AES-256; the key is not recoverable without the backup password.")
+        return False
     elif enc is False:
         print("[*] Encryption: not encrypted")
     work = Path(out_dir) / label
