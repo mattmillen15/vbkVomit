@@ -1899,6 +1899,8 @@ def _extract_via_dissect(vbk_path, work, want_ntds):
             if starts:
                 print(f"  [*] NTFS candidates at: {[f'{s:,}' for s in starts]}")
             for start in starts:
+                if not (set(want) - set(found)):
+                    break   # all wanted files already extracted
                 try:
                     ntfs = _RobustNTFS(RangeStream(df, start, size - start))
                 except Exception:
