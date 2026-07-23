@@ -25,10 +25,13 @@ Re-running against the same backup is instant (it's all cached).
 ## Extraction modes (`-m`)
 
 ```bash
-python3 vbkvomit.py --local-path /mnt/backups/dc.vbk            # fast (default)
-python3 vbkvomit.py --local-path /mnt/backups/dc.vbk -m mft     # MFT scan fallback
-python3 vbkvomit.py --local-path /mnt/backups/dc.vbk -m full-extract --extract-dir /tmp/images
+python3 vbkvomit.py --local-path /mnt/backups/dc.vbk                                    # fast (default)
+python3 vbkvomit.py --local-path /mnt/backups/dc.vbk -m mft                             # MFT scan fallback
+python3 vbkvomit.py --local-path /mnt/backups/dc.vbk -m full-extract --extract-dir /tmp # dump full VHD
 ```
+
+After `full-extract`, vbkvomit prints the exact `vhdvomit.py --local-path` command to run
+against the output VHD.
 
 | Mode | What it does | Needs |
 |------|-------------|-------|
@@ -55,6 +58,29 @@ See [research.md](research.md) — short version: Veeam stores the disk as ~1 MB
 by its actual content (ESE page checksums for ntds, `regf`/`hbin` for hives) instead of
 guessing. And instead of scanning the whole file for blocks, we read Veeam's own block
 directory (~5 MB) to know where everything is.
+
+## Encryption detection
+
+vbkvomit checks whether a VBK is encrypted before attempting extraction. Encrypted VBKs
+exit immediately with a clear message rather than producing garbage output or cryptic errors.
+
+**Detection order:**
+
+1. `.vbm` sidecar file — Veeam writes a plaintext XML sidecar to the same directory as the
+   VBK. It contains an `EncryptionState` attribute:
+   - `0` → plaintext
+   - `1` → encryption key configured on the job but not applied to this backup run (readable)
+   - `2` → AES-256 encrypted (extraction blocked)
+
+2. Dissect block-level check — if no `.vbm` is present, reads `keyset_id` from FIB block
+   descriptors in the VBK. Non-null keyset = encrypted.
+
+3. Dissect parse failure — encrypted VBKs have encrypted block-store metadata. If dissect
+   crashes traversing the VBK structure and no `.vbm` was found, the VBK is treated as
+   encrypted.
+
+Encrypted VBKs use AES-256. The key is not recoverable without the backup password — there
+is no offline bypass.
 
 ## Needs
 
