@@ -1730,6 +1730,23 @@ def _mft_scan_v9(df, partition_offset, work, want):
     return found
 
 
+def _vbm_ntfs_offsets(vbk_path):
+    """Parse sibling .vbm for NTFS volume extents → list of StartingOffset values.
+    Returns [] if no VBM found or no NTFS extents present."""
+    import re as _re2, html as _html
+    vbk_p = pathlib.Path(vbk_path)
+    vbm_candidates = list(vbk_p.parent.glob("*.vbm"))
+    if not vbm_candidates:
+        return []
+    txt = _html.unescape(vbm_candidates[0].read_text(errors="replace"))
+    offsets = []
+    # Find all Volume elements with FilesystemType="NTFS" and extract their Extent StartingOffset
+    for vol_m in _re2.finditer(r'<Volume\s[^>]*FilesystemType="NTFS"[^>]*>(.*?)</Volume>', txt, _re2.DOTALL):
+        for ext_m in _re2.finditer(r'<Extent\s[^>]*StartingOffset="(\d+)"', vol_m.group(0)):
+            offsets.append(int(ext_m.group(1)))
+    return offsets
+
+
 def _count_stored_fib_blocks(df):
     """Return (stored, total) FIB block counts for a FibStream, or (-1, -1) on error."""
     try:
@@ -1831,26 +1848,56 @@ def _extract_via_dissect(vbk_path, work, want_ntds):
             if stored_blocks >= 0 and total_blocks > 0 and stored_blocks / total_blocks < 0.05:
                 sparse_disks.append((item.name, stored_blocks, total_blocks))
 
-            # NTFS volume offsets: MBR partitions, else scan for VBRs
+            # NTFS volume offsets: MBR/GPT partitions, then VBR scan fallback
             starts = []
             try:
                 df.seek(0)
                 mbr = df.read(512)
                 if mbr[510:512] == b"\x55\xaa":
+                    has_gpt = False
                     for pi in range(4):
                         e = mbr[446 + pi * 16: 446 + pi * 16 + 16]
-                        if e[4] and e[4] != 0xEE:
+                        if e[4] == 0xEE:
+                            has_gpt = True
+                        elif e[4]:
                             s = struct.unpack_from("<I", e, 8)[0] * 512
                             if 0 < s < size: starts.append(s)
+                    if has_gpt:
+                        # GPT header at LBA 1 (byte 512); partition entries follow
+                        df.seek(512)
+                        gpt = df.read(92)
+                        if gpt[:8] == b"EFI PART":
+                            pe_lba  = struct.unpack_from("<Q", gpt, 72)[0]
+                            n_ent   = struct.unpack_from("<I", gpt, 80)[0]
+                            ent_sz  = struct.unpack_from("<I", gpt, 84)[0]
+                            df.seek(pe_lba * 512)
+                            for _ in range(min(n_ent, 128)):
+                                entry = df.read(ent_sz)
+                                if any(b != 0 for b in entry[:16]):
+                                    fl = struct.unpack_from("<Q", entry, 32)[0]
+                                    s  = fl * 512
+                                    if 0 < s < size:
+                                        starts.append(s)
             except Exception:
                 pass
+            if not starts:
+                try:
+                    starts = [s for s in _vbm_ntfs_offsets(vbk_path) if 0 < s < size]
+                except Exception:
+                    pass
             if not starts:
                 for off in range(0, min(size, 2 << 30), 1 << 20):
                     try:
                         df.seek(off)
-                        if df.read(11) == _NTFS_VBR: starts.append(off)
+                        chunk = df.read(11)
+                        if len(chunk) < 11:
+                            break
+                        if chunk == _NTFS_VBR:
+                            starts.append(off)
                     except Exception:
-                        break
+                        continue
+            if starts:
+                print(f"  [*] NTFS candidates at: {[f'{s:,}' for s in starts]}")
             for start in starts:
                 try:
                     ntfs = _RobustNTFS(RangeStream(df, start, size - start))
