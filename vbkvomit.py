@@ -1485,12 +1485,7 @@ def _dump_images_via_dissect(vbk_path, out_dir):
                 print(f"\n  [+] {out_path} "
                       f"({size/(1<<30):.1f} GB, {sparse_bytes/(1<<30):.1f} GB sparse, "
                       f"{time.time()-t0:.1f}s)")
-                print(f"  [*] Mount hints (Linux):")
-                print(f"        sudo modprobe nbd")
-                print(f"        sudo qemu-nbd -c /dev/nbd0 {out_path}")
-                print(f"        sudo partprobe /dev/nbd0")
-                print(f"        sudo mount -o ro /dev/nbd0p1 /mnt/vhd")
-                print(f"  [*] Mount hints (Windows): Disk Management → Action → Attach VHD/VHDX")
+                print(f"  [*] Run: sudo vhdvomit.py --local-path '{out_path}'")
                 images.append(out_path)
             except Exception as e:
                 print(f"\n  [!] Dump failed: {e}")
