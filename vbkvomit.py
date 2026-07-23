@@ -1239,16 +1239,16 @@ def _vhd_footer(disk_size):
     struct.pack_into(">I", footer, 32, 0x000A0000)          # creator ver 10.0
     footer[36:40] = b"Wi2k"
     struct.pack_into(">Q", footer, 40, disk_size)           # original size
-    struct.pack_into(">Q", footer, 48, disk_size)           # current size
-    footer[52] = (cyls >> 8) & 0xFF
-    footer[53] = cyls & 0xFF
-    footer[54] = heads & 0xFF
-    footer[55] = spt & 0xFF
-    struct.pack_into(">I", footer, 56, 2)                   # disk type: fixed
-    footer[60:64] = b"\x00\x00\x00\x00"                    # checksum placeholder
-    footer[64:80] = uuid.uuid4().bytes
+    struct.pack_into(">Q", footer, 48, disk_size)           # current size (48-55)
+    footer[56] = (cyls >> 8) & 0xFF                         # disk geometry (56-59)
+    footer[57] = cyls & 0xFF
+    footer[58] = heads & 0xFF
+    footer[59] = spt & 0xFF
+    struct.pack_into(">I", footer, 60, 2)                   # disk type: fixed (60-63)
+    footer[64:68] = b"\x00\x00\x00\x00"                    # checksum placeholder (64-67)
+    footer[68:84] = uuid.uuid4().bytes                      # unique ID (68-83)
     csum = (~sum(footer)) & 0xFFFFFFFF
-    struct.pack_into(">I", footer, 60, csum)
+    struct.pack_into(">I", footer, 64, csum)
     return bytes(footer)
 
 
