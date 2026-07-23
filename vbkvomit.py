@@ -90,6 +90,14 @@ def size_str(path):
         sz /= 1024
     return f"{sz:.1f}PB"
 
+def _fmt_eta(seconds):
+    s = int(seconds)
+    h, rem = divmod(s, 3600)
+    m, s = divmod(rem, 60)
+    if h:   return f"{h}h {m:02d}m {s:02d}s"
+    if m:   return f"{m}m {s:02d}s"
+    return f"{s}s"
+
 
 # ═══ VBK file format primitives ════════════════════════════════════════════════
 
@@ -708,7 +716,7 @@ class VBKExtractor:
                     rate = processed / max(elapsed, 0.1)
                     eta = (len(fib_offsets) - processed) / max(rate, 1)
                     tprint(f"      {processed}/{len(fib_offsets)} blocks, "
-                           f"{len(hits)} matches, ETA {eta:.0f}s")
+                           f"{len(hits)} matches, ETA {_fmt_eta(eta)}")
                     last_report = processed
             pool.terminate()
         return hits
@@ -1441,7 +1449,7 @@ def _dump_images_via_dissect(vbk_path, out_dir):
                                 mbps = (pos >> 20) / max(elapsed, 0.1)
                                 eta = ((size - pos) >> 20) / max(mbps, 0.1)
                                 print(f"    {100*pos//size}%  {pos/(1<<30):.1f}/{size/(1<<30):.1f} GB"
-                                      f"  {mbps:.0f} MB/s  ETA {eta:.0f}s      ", end="\r")
+                                      f"  {mbps:.0f} MB/s  ETA {_fmt_eta(eta)}      ", end="\r")
 
                         if is_vhdx:
                             img.truncate(size)
