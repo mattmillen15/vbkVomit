@@ -1537,18 +1537,46 @@ def _mft_scan_v9(df, partition_offset, work, want):
         df.seek(partition_offset)
         vbr = df.read(512)
     except Exception:
-        return {}
-    if vbr[3:11] != b"NTFS    ":
-        return {}
+        vbr = b""
 
-    bps = struct.unpack_from("<H", vbr, 11)[0]   # bytes per sector
-    cs  = bps * vbr[13]                           # cluster size
-    mft_lcn = struct.unpack_from("<Q", vbr, 48)[0]
-    raw_cpfrs = vbr[64]                           # clusters-per-file-record (unsigned)
-    rs = 2 ** (256 - raw_cpfrs) if raw_cpfrs >= 128 else raw_cpfrs * cs
-    rs = max(int(rs), 512)                        # record size, floor 512 bytes
-
-    mft_start = partition_offset + mft_lcn * cs
+    if vbr[3:11] == b"NTFS    ":
+        bps = struct.unpack_from("<H", vbr, 11)[0]
+        cs  = bps * vbr[13]
+        mft_lcn  = struct.unpack_from("<Q", vbr, 48)[0]
+        raw_cpfrs = vbr[64]
+        rs = 2 ** (256 - raw_cpfrs) if raw_cpfrs >= 128 else raw_cpfrs * cs
+        rs = max(int(rs), 512)
+        mft_start = partition_offset + mft_lcn * cs
+    else:
+        # VBR block is sparse (CBT backup skips pre-cluster volume metadata).
+        # Probe for $MFT at common Windows 10/11 positions without using the VBR.
+        # Win10/11 on NVMe places $MFT at LCN 786432 (3 GB into volume) for large
+        # SSDs to allow future expansion; older/smaller disks use LCN 4.
+        bps = 512; rs = 1024
+        mft_start = None
+        _probe_offsets = [
+            (4096, 786432), (4096, 262144), (4096, 393216),
+            (4096, 4),      (4096, 2),      (4096, 6),
+            (8192, 786432), (8192, 4),
+            (2048, 786432), (2048, 4),
+        ]
+        for try_cs, try_lcn in _probe_offsets:
+            test_off = partition_offset + try_lcn * try_cs
+            if test_off <= partition_offset:
+                continue
+            try:
+                df.seek(test_off)
+                hdr = df.read(48)
+                # Validate: FILE magic + sane update-sequence count (2 = 1 KB record)
+                if hdr[:4] == b"FILE" and struct.unpack_from("<H", hdr, 6)[0] in (2, 3):
+                    cs = try_cs; mft_start = test_off
+                    print(f"  [*] VBR sparse — $MFT probed at {mft_start:,} "
+                          f"(cluster_size={cs}, LCN {try_lcn})")
+                    break
+            except Exception:
+                continue
+        if mft_start is None:
+            return {}
 
     def parse_runs(data):
         """NTFS run list → [(lcn_or_None, cluster_count)]."""
@@ -1901,34 +1929,41 @@ def _extract_via_dissect(vbk_path, work, want_ntds):
             for start in starts:
                 if not (set(want) - set(found)):
                     break   # all wanted files already extracted
+                ntfs = None; _broken = False
                 try:
                     ntfs = _RobustNTFS(RangeStream(df, start, size - start))
+                except _BrokenIndexError:
+                    pass   # init raised BrokenIndexError — ntfs partially constructed
                 except Exception:
-                    continue
-                # Try dissect NTFS path lookup first; if INDX blocks are sparse
-                # (v9 format), _BrokenIndexError is raised → fall back to MFT scan.
-                _broken = False
-                for out_name, paths in want.items():
-                    if out_name in found:
-                        continue
-                    for p in paths:
-                        try:
-                            data = ntfs.mft.get(p).open().read()
-                            dst = work / out_name
-                            dst.write_bytes(data)
-                            found[out_name] = dst
-                            print(f"  [+] {out_name} ({len(data):,} bytes) from disk {item.name}")
-                            break
-                        except _BrokenIndexError:
-                            _broken = True
-                            break
-                        except Exception:
+                    pass   # NTFS init failed (VBR sparse, wrong fs type, etc.)
+
+                if ntfs is not None:
+                    # Try dissect NTFS path lookup first; if INDX blocks are sparse
+                    # (v9 format), _BrokenIndexError is raised → fall back to MFT scan.
+                    _broken = False
+                    for out_name, paths in want.items():
+                        if out_name in found:
                             continue
-                    if _broken:
-                        break
-                if _broken and set(want) - set(found):
-                    # v9 VBK: directory INDX blocks sparse, NTFS traversal fails.
-                    # Scan MFT records directly by filename — no INDX access needed.
+                        for p in paths:
+                            try:
+                                data = ntfs.mft.get(p).open().read()
+                                dst = work / out_name
+                                dst.write_bytes(data)
+                                found[out_name] = dst
+                                print(f"  [+] {out_name} ({len(data):,} bytes) from disk {item.name}")
+                                break
+                            except _BrokenIndexError:
+                                _broken = True
+                                break
+                            except Exception:
+                                continue
+                        if _broken:
+                            break
+
+                if (ntfs is None or _broken) and set(want) - set(found):
+                    # v9 VBK: either VBR block is sparse (NTFS couldn't open) or
+                    # directory INDX blocks are sparse (path traversal fails).
+                    # Scan MFT records directly by filename — no VBR/INDX access needed.
                     remaining = {k: v for k, v in want.items() if k not in found}
                     found.update(_mft_scan_v9(df, start, work, remaining))
     print(f"[*] extraction done ({time.time()-t0:.1f}s)")
