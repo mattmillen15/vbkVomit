@@ -1197,6 +1197,112 @@ def _target_kind(path):
 
 # ═══ Per-VBK pipeline ════════════════════════════════════════════════════════
 
+# ═══ Full-extract path (--full-extract): dump raw disk image via dissect ══════
+
+def _dump_images_via_dissect(vbk_path, out_dir):
+    """Stream every disk stored in a VBK to out_dir as a raw .img file.
+    Uses dissect's content-addressed block resolver — same as --fast but writes
+    the entire volume instead of specific files."""
+    from dissect.archive import vbk as _vbk
+    from dissect.archive.vbk import FibStream
+    from dissect.util.compression import lz4 as _lz4
+
+    fh = open(vbk_path, "rb")
+    v = _vbk.VBK(fh)
+    print(f"[*] VBK opened (dissect, format v{v.format_version})")
+    h2blk = {}
+    for i in range(v.block_store.count):
+        sd = v.block_store.get(i)
+        h2blk[bytes(sd.digest)] = sd
+    print(f"[*] {len(h2blk)} blocks in digest map")
+
+    def _read(self, offset, length):
+        result = []; bs = self.vbk.block_size
+        while length > 0:
+            bi = offset // bs; oib = offset % bs; rs = min(length, bs - oib)
+            bd = self.table.get(bi)
+            if int(bd.type) == 1:
+                result.append(b"\x00" * rs)
+            else:
+                sd = h2blk.get(bytes(bd.digest))
+                if sd is None:
+                    result.append(b"\x00" * rs)
+                else:
+                    self.vbk.fh.seek(sd.offset)
+                    raw = self.vbk.fh.read(sd.compressed_size)
+                    result.append((_lz4.decompress(memoryview(raw)[12:], sd.source_size)
+                                   if sd.is_compressed() else raw)[oib:oib + rs])
+            offset += rs; length -= rs
+        return b"".join(result)
+    FibStream._read = _read
+
+    images = []
+    CHUNK = 1 << 20
+    ZEROS = b"\x00" * CHUNK
+
+    for folder in v.root.iterdir():
+        for item in folder.iterdir():
+            try:
+                if item.is_dir() or item.size < (16 << 20):
+                    continue
+            except Exception:
+                continue
+            nm = item.name.lower()
+            if nm.endswith((".xml", ".zip")) or nm.startswith("digest_"):
+                continue
+            size = item.size
+            out_path = out_dir / (Path(item.name).stem + ".img")
+            print(f"[*] Dumping {item.name} ({size / (1 << 30):.1f} GB) → {out_path}")
+            try:
+                df = item.open()
+                df.seek(0)
+                t0 = time.time(); pos = 0; sparse_bytes = 0
+                with open(out_path, "wb") as img:
+                    while pos < size:
+                        n = min(CHUNK, size - pos)
+                        chunk = df.read(n)
+                        if len(chunk) < n:
+                            chunk += b"\x00" * (n - len(chunk))
+                        if chunk == ZEROS[:n]:
+                            img.seek(n, 1)
+                            sparse_bytes += n
+                        else:
+                            img.write(chunk)
+                        pos += n
+                        if pos % (128 << 20) == 0 or pos >= size:
+                            elapsed = time.time() - t0
+                            mbps = (pos >> 20) / max(elapsed, 0.1)
+                            eta = ((size - pos) >> 20) / max(mbps, 0.1)
+                            print(f"    {100*pos//size}%  {pos/(1<<30):.1f}/{size/(1<<30):.1f} GB"
+                                  f"  {mbps:.0f} MB/s  ETA {eta:.0f}s      ", end="\r")
+                    img.truncate(size)
+                print(f"\n  [+] {out_path} "
+                      f"({size/(1<<30):.1f} GB, {sparse_bytes/(1<<30):.1f} GB sparse, "
+                      f"{time.time()-t0:.1f}s)")
+                print(f"  [*] Mount hints:")
+                print(f"        sudo losetup -fP --show {out_path}")
+                print(f"        # -P exposes partitions as /dev/loopNp1, p2, ...")
+                print(f"        # sudo mount -o ro /dev/loopNpX /mnt/img")
+                print(f"        # or direct (no MBR): sudo mount -o loop,ro {out_path} /mnt/img")
+                images.append(out_path)
+            except Exception as e:
+                print(f"\n  [!] Dump failed: {e}")
+    return images
+
+
+def _process_vbk_full_extract(vbk_path, out_dir):
+    try:
+        images = _dump_images_via_dissect(vbk_path, Path(out_dir))
+    except ImportError as e:
+        print(f"[!] --full-extract needs the 'dissect' library ({e}).")
+        print("    Install it: pip install dissect")
+        return False
+    except Exception as e:
+        print(f"[!] Full extract failed: {e}")
+        return False
+    return bool(images)
+
+
 # ═══ Fast path (--fast): dissect-based direct extraction ══════════════════════
 # Instead of scan + content-verified reassembly, use Fox-IT's `dissect` library
 # to resolve the VBK's content-addressed (deduplicated) blocks by their digest,
@@ -1347,13 +1453,17 @@ def _process_vbk_fast(vbk_path, sd_path, work, want_ntds):
     return True
 
 
-def process_vbk(vbk_path, sd_path, out_dir, label=None, want_ntds=False, fast=False):
+def process_vbk(vbk_path, sd_path, out_dir, label=None, want_ntds=False, fast=False,
+                full_extract=False):
     label = label or Path(vbk_path).stem
     print(f"\n{'='*72}")
     print(f"[*] Processing {vbk_path}  ({size_str(vbk_path)})")
     print(f"{'='*72}")
     work = Path(out_dir) / label
     work.mkdir(parents=True, exist_ok=True)
+
+    if full_extract:
+        return _process_vbk_full_extract(vbk_path, work)
 
     if fast:
         return _process_vbk_fast(vbk_path, sd_path, work, want_ntds)
@@ -1662,7 +1772,8 @@ def run_smb(args, sd_path, out_dir):
         vbks = find_vbk_files(scan_paths, workers=args.workers)
         if not vbks: print("[!] No VBK files found"); return
         for vbk in select_vbk(vbks):
-            process_vbk(vbk, sd_path, out_dir, want_ntds=args.ntds, fast=args.fast)
+            process_vbk(vbk, sd_path, out_dir, want_ntds=args.ntds, fast=args.fast,
+                        full_extract=args.full_extract)
         print("\n[+] Done")
     finally:
         for m in mounted:
@@ -1686,10 +1797,12 @@ def run_local(args, sd_path, out_dir):
         vbks.extend(find_vbk_files(dirs, workers=args.workers))
     if not vbks: print("[!] No VBK files found"); return
     if len(vbks) == 1:
-        process_vbk(vbks[0], sd_path, out_dir, want_ntds=args.ntds, fast=args.fast)
+        process_vbk(vbks[0], sd_path, out_dir, want_ntds=args.ntds, fast=args.fast,
+                    full_extract=args.full_extract)
     else:
         for vbk in select_vbk(vbks):
-            process_vbk(vbk, sd_path, out_dir, want_ntds=args.ntds, fast=args.fast)
+            process_vbk(vbk, sd_path, out_dir, want_ntds=args.ntds, fast=args.fast,
+                        full_extract=args.full_extract)
     print("\n[+] Done")
 
 
@@ -1733,6 +1846,11 @@ Examples:
                         "VBK's dedup blocks by digest and read files directly "
                         "(~5-15x faster, no scan). Needs 'pip install dissect'. "
                         "Falls back guidance printed if unavailable.")
+    p.add_argument("--full-extract", action="store_true",
+                   help="Dump complete raw disk image(s) from the VBK to the output "
+                        "directory as .img files. Uses dissect (pip install dissect). "
+                        "Images can be mounted with 'sudo losetup -fP --show <img>'. "
+                        "Useful when targeted extraction fails (e.g. unusual VBK layout).")
     args = p.parse_args()
 
     if args.target is not None:
