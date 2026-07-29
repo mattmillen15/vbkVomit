@@ -2299,11 +2299,18 @@ def _secretsdump_imports_ok(cmd):
 def find_secretsdump():
     """Return an argv prefix (list) for a *working* secretsdump, or None.
 
-    We build candidate commands from PATH plus the invoking user's
-    ~/.local/bin (important under sudo, where PATH is reset and the pip
-    --user install disappears), then pick the first candidate that actually
-    imports cleanly — a mismatched impacket crashes at startup otherwise."""
+    Priority: (1) current venv bin/ — keeps secretsdump and impacket in sync;
+    (2) invoking user's ~/.local/bin (survives sudo PATH reset); (3) PATH.
+    We then verify the winner imports cleanly — a version-mismatched impacket
+    crashes at startup with ImportError/Traceback otherwise."""
     candidates = []
+    # 1. Venv bin — most specific; avoids user-local version mismatches
+    venv_bin = Path(sys.prefix) / "bin"
+    for n in ("secretsdump.py", "impacket-secretsdump"):
+        p = venv_bin / n
+        if p.exists():
+            candidates.append([str(p)])
+    # 2. Invoking user's ~/.local/bin (important under sudo, where PATH is reset)
     bin_paths = []
     su = os.environ.get("SUDO_USER")
     if su:
@@ -2313,6 +2320,7 @@ def find_secretsdump():
     for p in bin_paths:
         if p.exists():
             candidates.append([sys.executable, str(p)])
+    # 3. PATH
     for n in ("secretsdump.py", "impacket-secretsdump"):
         p = shutil.which(n)
         if p:

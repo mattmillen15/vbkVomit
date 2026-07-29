@@ -1,5 +1,5 @@
 # Required for SMB enumeration and authentication
-impacket
+impacket>=0.13.0
 
 # Required for fast extraction mode (-m fast, default)
 dissect
