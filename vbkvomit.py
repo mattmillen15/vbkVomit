@@ -1762,7 +1762,7 @@ def _vbm_ntfs_offsets(vbk_path):
     """Parse sibling .vbm for NTFS volume extents → list of StartingOffset values.
     Returns [] if no VBM found or no NTFS extents present."""
     import re as _re2, html as _html
-    vbk_p = pathlib.Path(vbk_path)
+    vbk_p = Path(vbk_path)
     vbm_candidates = list(vbk_p.parent.glob("*.vbm"))
     if not vbm_candidates:
         return []
@@ -1829,7 +1829,9 @@ def _extract_via_dissect(vbk_path, work, want_ntds):
     for i in range(v.block_store.count):
         sd = v.block_store.get(i)
         h2blk[bytes(sd.digest)] = sd
-    print(f"[*] digest→block map: {len(h2blk)} blocks ({time.time()-t0:.1f}s)")
+    print(f"[*] digest→block map: {len(h2blk)} blocks, block_store.count={v.block_store.count} ({time.time()-t0:.1f}s)")
+    if len(h2blk) == 0:
+        print(f"  [!] WARNING: digest map is empty — block reads will return zeros (unsupported VBK version?)")
 
     def _read(self, offset, length):
         out = []; bs = self.vbk.block_size
@@ -1939,7 +1941,7 @@ def _extract_via_dissect(vbk_path, work, want_ntds):
 
                 if ntfs is not None:
                     # Try dissect NTFS path lookup first; if INDX blocks are sparse
-                    # (v9 format), _BrokenIndexError is raised → fall back to MFT scan.
+                    # (v9/v12 format), _BrokenIndexError is raised → fall back to MFT scan.
                     _broken = False
                     for out_name, paths in want.items():
                         if out_name in found:
@@ -1955,15 +1957,22 @@ def _extract_via_dissect(vbk_path, work, want_ntds):
                             except _BrokenIndexError:
                                 _broken = True
                                 break
-                            except Exception:
+                            except Exception as _e:
+                                print(f"  [*] path lookup {p!r}: {type(_e).__name__}: {_e}")
                                 continue
                         if _broken:
                             break
 
-                if (ntfs is None or _broken) and set(want) - set(found):
-                    # v9 VBK: either VBR block is sparse (NTFS couldn't open) or
-                    # directory INDX blocks are sparse (path traversal fails).
-                    # Scan MFT records directly by filename — no VBR/INDX access needed.
+                if set(want) - set(found):
+                    # Fallback: scan MFT records directly by filename.
+                    # Handles: (1) VBR sparse — ntfs is None; (2) INDX sparse — _broken;
+                    # (3) v12 path-traversal failure with non-BrokenIndexError exceptions.
+                    if ntfs is None:
+                        print(f"  [*] NTFS init failed for offset {start:,} — trying MFT scan")
+                    elif _broken:
+                        print(f"  [*] Broken INDX at offset {start:,} — trying MFT scan")
+                    else:
+                        print(f"  [*] Path lookups failed at offset {start:,} — trying MFT scan")
                     remaining = {k: v for k, v in want.items() if k not in found}
                     found.update(_mft_scan_v9(df, start, work, remaining))
     print(f"[*] extraction done ({time.time()-t0:.1f}s)")
