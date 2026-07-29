@@ -2299,18 +2299,25 @@ def _secretsdump_imports_ok(cmd):
 def find_secretsdump():
     """Return an argv prefix (list) for a *working* secretsdump, or None.
 
-    Priority: (1) current venv bin/ — keeps secretsdump and impacket in sync;
-    (2) invoking user's ~/.local/bin (survives sudo PATH reset); (3) PATH.
-    We then verify the winner imports cleanly — a version-mismatched impacket
-    crashes at startup with ImportError/Traceback otherwise."""
+    Priority: (1) PATH — respects whatever the current shell has active,
+    including activated venvs; (2) current Python prefix bin/ — catches
+    the sudo case where PATH is reset but sys.prefix still points to the
+    venv; (3) SUDO_USER ~/.local/bin — last resort for sudo + user-local
+    installs.  The first candidate that imports cleanly wins."""
     candidates = []
-    # 1. Venv bin — most specific; avoids user-local version mismatches
+    # 1. PATH — works for system installs, activated venvs, anything in shell context
+    for n in ("secretsdump.py", "impacket-secretsdump"):
+        p = shutil.which(n)
+        if p:
+            candidates.append([p])
+    # 2. Current Python prefix bin/ — catches sudo where PATH is sanitised
+    #    but sys.prefix still resolves to the venv (or system) correctly.
     venv_bin = Path(sys.prefix) / "bin"
     for n in ("secretsdump.py", "impacket-secretsdump"):
         p = venv_bin / n
         if p.exists():
             candidates.append([str(p)])
-    # 2. Invoking user's ~/.local/bin (important under sudo, where PATH is reset)
+    # 3. SUDO_USER ~/.local/bin — user-local pip install, survives sudo PATH reset
     bin_paths = []
     su = os.environ.get("SUDO_USER")
     if su:
@@ -2320,11 +2327,6 @@ def find_secretsdump():
     for p in bin_paths:
         if p.exists():
             candidates.append([sys.executable, str(p)])
-    # 3. PATH
-    for n in ("secretsdump.py", "impacket-secretsdump"):
-        p = shutil.which(n)
-        if p:
-            candidates.append([p])
     seen, uniq = set(), []
     for c in candidates:
         k = tuple(c)
