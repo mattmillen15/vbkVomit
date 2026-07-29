@@ -1957,6 +1957,8 @@ def _extract_via_dissect(vbk_path, work, want_ntds):
                             except _BrokenIndexError:
                                 _broken = True
                                 break
+                            except FileNotFoundError:
+                                continue   # file simply not on this partition
                             except Exception as _e:
                                 print(f"  [*] path lookup {p!r}: {type(_e).__name__}: {_e}")
                                 continue
@@ -1994,6 +1996,10 @@ def _process_vbk_fast(vbk_path, sd_path, work, want_ntds):
         print(f"[!] --fast needs the 'dissect' library ({e}).")
         print("    Install it (pip install dissect) or run without --fast.")
         return False
+    except PermissionError as e:
+        print(f"[!] Permission denied: {e}")
+        print("    Re-run as root (sudo python3 vbkvomit.py ...) or fix file permissions.")
+        return False
     except Exception as e:
         print(f"[!] fast extraction failed: {e}")
         print("    Falling back is available by re-running without --fast.")
@@ -2027,6 +2033,12 @@ def process_vbk(vbk_path, sd_path, out_dir, label=None, want_ntds=False, fast=Fa
     print(f"\n{'='*72}")
     print(f"[*] Processing {vbk_path}  ({size_str(vbk_path)})")
     print(f"{'='*72}")
+    try:
+        open(vbk_path, "rb").close()
+    except PermissionError:
+        print(f"[!] Permission denied: cannot read {vbk_path}")
+        print(f"    Re-run as root (sudo python3 vbkvomit.py ...) or fix file permissions.")
+        return False
     enc = _vbk_encrypted(vbk_path)
     if enc is True:
         print("[!] ENCRYPTED — this VBK is password-protected. Extraction not possible.")
